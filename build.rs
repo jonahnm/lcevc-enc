@@ -59,10 +59,39 @@ fn main() {
     }
     status.push_str(&format!("sources: {} files\n", files.len()));
 
-    // Locate the C++ compiler.
-    let compiler = find_compiler(&target);
-    let Some(cc) = compiler else {
-        let msg = "no C++ compiler found (tried PATH cl, vswhere, VS install roots)".to_string();
+    // Probe every candidate compiler with the first source file; the
+    // first one that actually compiles it wins (a broken cl.exe on PATH,
+    // for example, must not veto a working vswhere-found toolchain).
+    let candidates = find_compilers(&target);
+    let mut cc: Option<Compiler> = None;
+    let mut probe_error: Option<String> = None;
+    for cand in &candidates {
+        let obj = out.join("vvenc_probe.o");
+        let out = cand.command(&files[0], &obj, &inc, arch).output();
+        match out {
+            Ok(o) if o.status.success() => {
+                cc = Some(cand.clone());
+                let _ = std::fs::remove_file(&obj);
+                break;
+            }
+            Ok(o) => {
+                probe_error = Some(format!(
+                    "{} (exit {})",
+                    cand.cxx.display(),
+                    o.status.code().unwrap_or(-1)
+                ));
+            }
+            Err(e) => {
+                probe_error = Some(format!("{}: {e}", cand.cxx.display()));
+            }
+        }
+    }
+    let Some(cc) = cc else {
+        let msg = format!(
+            "no working C++ compiler (probed {}; last failure: {})",
+            candidates.len(),
+            probe_error.unwrap_or_else(|| "unknown".into())
+        );
         eprintln!("build.rs: {msg}");
         finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
@@ -83,18 +112,27 @@ fn main() {
     let mut failed = false;
     for f in &files {
         let obj = objdir.join(format!("{}.o", f.file_stem().unwrap().to_string_lossy()));
-        let mut cmd = cc.command(&f, &obj, &inc, arch);
-        let out = cmd.output();
+        let out = cc.command(&f, &obj, &inc, arch).output();
         match out {
             Ok(o) if o.status.success() => objs.push(obj),
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr);
-                let first = err
-                    .lines()
-                    .find(|l| l.contains("error"))
-                    .unwrap_or_else(|| err.lines().next().unwrap_or("no diagnostics"));
-                println!("cargo:warning=vvenc: compile failed for {}", f.display());
-                println!("cargo:warning=vvenc:     {first}");
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                println!(
+                    "cargo:warning=vvenc: compile failed for {} (exit {})",
+                    f.display(),
+                    o.status.code().unwrap_or(-1)
+                );
+                let mut shown = 0;
+                for l in stdout.lines().chain(err.lines()) {
+                    if !l.trim().is_empty() && shown < 8 {
+                        println!("cargo:warning=vvenc:     {l}");
+                        shown += 1;
+                    }
+                }
+                if shown == 0 {
+                    println!("cargo:warning=vvenc:     (no compiler output)");
+                }
                 failed = true;
                 break;
             }
@@ -273,6 +311,7 @@ fn collect_sources(src_lib: &Path, arch: Arch) -> Vec<PathBuf> {
     files
 }
 
+#[derive(Clone)]
 struct Compiler {
     kind: CompilerKind,
     cxx: PathBuf,
@@ -280,6 +319,7 @@ struct Compiler {
     env: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
 enum CompilerKind {
     Msvc,
     Gnu,
@@ -416,11 +456,12 @@ impl Compiler {
     }
 }
 
-fn find_compiler(target: &str) -> Option<Compiler> {
+fn find_compilers(target: &str) -> Vec<Compiler> {
+    let mut out = Vec::new();
     if target.contains("windows") {
         // 1. cl.exe already on PATH (a VS developer prompt).
         if let Ok(_) = Command::new("cl").arg("/?").status() {
-            return Some(Compiler {
+            out.push(Compiler {
                 kind: CompilerKind::Msvc,
                 cxx: PathBuf::from("cl"),
                 env: vec![],
@@ -428,7 +469,7 @@ fn find_compiler(target: &str) -> Option<Compiler> {
         }
         // 2. Locate the BuildTools install via vswhere.
         if let Some((cl, env)) = msvc_vswhere() {
-            return Some(Compiler {
+            out.push(Compiler {
                 kind: CompilerKind::Msvc,
                 cxx: cl,
                 env,
@@ -440,26 +481,25 @@ fn find_compiler(target: &str) -> Option<Compiler> {
             r"C:\Program Files\Microsoft Visual Studio",
         ] {
             if let Some((cl, env)) = scan_vs_root(root) {
-                return Some(Compiler {
+                out.push(Compiler {
                     kind: CompilerKind::Msvc,
                     cxx: cl,
                     env,
                 });
             }
         }
-        None
     } else {
         for cand in ["c++", "g++", "clang++"] {
             if let Ok(_) = Command::new(cand).arg("--version").status() {
-                return Some(Compiler {
+                out.push(Compiler {
                     kind: CompilerKind::Gnu,
                     cxx: PathBuf::from(cand),
                     env: vec![],
                 });
             }
         }
-        None
     }
+    out
 }
 
 /// Find cl.exe + the SDK environment by walking the Visual Studio roots,
