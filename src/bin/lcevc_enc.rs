@@ -364,6 +364,8 @@ fn run(args: &[String]) -> Result<(), String> {
             base_depth: bit_depth,
             enhancement_depth: bit_depth,
             colour: colour.clone(),
+            scaling_l1,
+            scaling_l2,
             ..Default::default()
         };
         cfg.validate()?;

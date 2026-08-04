@@ -31,7 +31,9 @@ pub fn split_nals(data: &[u8]) -> Vec<(usize, usize)> {    let mut out = Vec::ne
     let mut i = 0;
     while i + 4 <= data.len() {
         let sc4 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 1;
-        let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 && (i + 3 >= data.len() || data[i + 3] != 0);
+        // A 3-byte start code may be followed by a 0x00 header byte (VVC
+        // layer-0 NALs start with 0x00), so no guard on the next byte.
+        let sc3 = data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1;
         if sc4 || sc3 {
             let start = i;
             let h = if sc4 { 4 } else { 3 };
@@ -41,8 +43,7 @@ pub fn split_nals(data: &[u8]) -> Vec<(usize, usize)> {    let mut out = Vec::ne
                 let e4 = end + 3 < data.len()
                     && data[end] == 0 && data[end + 1] == 0 && data[end + 2] == 0 && data[end + 3] == 1;
                 let e3 = end + 2 < data.len()
-                    && data[end] == 0 && data[end + 1] == 0 && data[end + 2] == 1
-                    && (end + 3 >= data.len() || data[end + 3] != 0);
+                    && data[end] == 0 && data[end + 1] == 0 && data[end + 2] == 1;
                 if e4 || e3 {
                     break;
                 }
@@ -61,24 +62,30 @@ pub fn split_nals(data: &[u8]) -> Vec<(usize, usize)> {    let mut out = Vec::ne
 /// starts a new unit. Returns the byte ranges of each AU (start codes kept).
 pub fn split_aus(base: &[u8]) -> Vec<(usize, usize)> {
     let nals = split_nals(base);
-    let mut aus = Vec::new();
-    let mut start: Option<usize> = None;
+    // Group by VCL NAL boundaries: each access unit runs from the start
+    // of the previous VCL NAL (or the start of the stream, so the first AU
+    // carries the parameter sets) to the start of the next VCL NAL.
+    let mut vcl: Vec<usize> = Vec::new();
     for (pos, _len) in &nals {
         let h = if base[*pos + 2] == 1 { 3 } else { 4 };
         let b1 = base[pos + h + 1];
         let ntype = (b1 >> 3) & 0x1F;
-        if ntype == 20 {
-            if let Some(s) = start {
-                aus.push((s, pos - s));
-            }
-            start = Some(*pos);
+        if ntype < 11 {
+            vcl.push(*pos);
         }
     }
-    if let Some(s) = start {
-        aus.push((s, base.len() - s));
+    if vcl.is_empty() {
+        if nals.is_empty() {
+            return Vec::new();
+        }
+        return vec![(0, base.len())];
     }
-    if aus.is_empty() && !nals.is_empty() {
-        aus.push((0, base.len()));
+    let mut aus = Vec::with_capacity(vcl.len());
+    let mut start = 0usize;
+    for (i, &v) in vcl.iter().enumerate() {
+        let end = if i + 1 < vcl.len() { vcl[i + 1] } else { base.len() };
+        aus.push((start, end - start));
+        start = end;
     }
     aus
 }
@@ -462,3 +469,28 @@ pub fn mux_mp4(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{split_aus, split_nals};
+
+    #[test]
+    fn split_nals_handles_zero_headers() {
+        // A 3-byte start code followed by a 0x00 NAL header byte (VVC
+        // layer-0 NALs) must be detected, as must 4-byte start codes.
+        let data: Vec<u8> = vec![
+            0, 0, 0, 1, 0x00, 0x79, // SPS (4-byte code, layer 0 -> 0x00 first byte)
+            0, 0, 1, 0x00, 0x02, // VCL with 0x00 header (3-byte code)
+            0, 0, 0, 1, 0x00, 0x03, // VCL with 0x00 header (4-byte code)
+            0, 0, 1, 0x00, 0x04, // VCL with 0x00 header (3-byte code)
+        ];
+        let nals = split_nals(&data);
+        assert_eq!(nals.len(), 4, "expected 4 NALs, got {}", nals.len());
+        let aus = split_aus(&data);
+        // 3 VCL NALs: first AU carries the SPS, then one AU per VCL.
+        assert_eq!(aus.len(), 3, "expected 3 AUs, got {}", aus.len());
+        // The first AU must contain the SPS (4-byte code at offset 0).
+        assert_eq!(aus[0].0, 0);
+        assert!(aus[0].1 >= 7);
+    }
+}
