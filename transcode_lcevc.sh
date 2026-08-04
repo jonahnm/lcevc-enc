@@ -109,10 +109,13 @@ esac
 # name (avoid 8-bit NV12/NV16 whose names contain "12"/"16").
 if [ "$DEPTH" -eq 8 ]; then
     case "$PF" in
-        *p10*|*p12*|*p14*|*p16*|*010*|*012*|*014*|*016*|*gray1[0246]*|*rgb4[89]*|*rgb64*)
+        *p10*|*p12*|*p14*|*p16*|*010*|*012*|*014*|*016*|*210*|*216*|*410*|\
+        *10le*|*12le*|*14le*|*16le*|*rgb4[89]*|*rgb64*|*ayuv64*|*gray1[0246]*)
             set_depth ;;
     esac
 fi
+
+echo "== detected: pix_fmt=${PF:-unknown}, bits_per_raw_sample=${BITS:-N/A} -> ${DEPTH}-bit pipeline =="
 
 # --- detect the total frame count (for the N/M progress + ETA) ---
 TOTAL_FRAMES="$("$FFPROBE" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"

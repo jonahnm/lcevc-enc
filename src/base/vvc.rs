@@ -42,7 +42,7 @@ pub fn encode_decode_vvc_gop(
         }
     }
 
-    let mut preset = "medium".to_string();
+    let mut preset = "faster".to_string();
     let mut qp = "30".to_string();
     {
         let state = crate::base::BASE_STATE.lock().unwrap();
@@ -57,9 +57,14 @@ pub fn encode_decode_vvc_gop(
         }
     }
     let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+    // NOTE: ffmpeg's -vvenc-params is a DICT option: the pairs are COLON
+    // separated and the keys are case-sensitive lowercase vvenc config keys
+    // ("internalbitdepth", "inputbitdepth", "threads", ...). mtprofile=3
+    // enables wavefront (WPP) + tiles (2 columns x 1 row, resolution
+    // dependent; degrades to WPP-only for small bases).
     let vvenc_params = format!(
-        "{}Threads={}",
-        if depth == 10 { "InternalBitDepth=10,InputBitDepth=10," } else { "InternalBitDepth=8,InputBitDepth=8," },
+        "internalbitdepth={}:inputbitdepth={}:threads={}:mtprofile=3",
+        depth, depth,
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
     );
 
@@ -169,7 +174,7 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
 
     // Encode with libvvenc. `extra` carries vvenc options like
     // "preset=fast,qp=27" (defaults: preset medium, qp 30).
-    let mut preset = "medium".to_string();
+    let mut preset = "faster".to_string();
     let mut qp = "30".to_string();
     for opt in extra.split(',') {
         if let Some(v) = opt.strip_prefix("preset=") {
@@ -180,8 +185,8 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
     }
     let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
     let vvenc_params = format!(
-        "{}Threads={}",
-        if depth == 10 { "InternalBitDepth=10,InputBitDepth=10," } else { "InternalBitDepth=8,InputBitDepth=8," },
+        "internalbitdepth={}:inputbitdepth={}:threads={}:mtprofile=3",
+        depth, depth,
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
     );
     let status = Command::new("ffmpeg")

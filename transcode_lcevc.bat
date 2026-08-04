@@ -103,7 +103,7 @@ echo !BITS! | findstr /r "10 12 14 16" >nul && (
 if "!DEPTH!"=="8" (
     rem Fallback when bits_per_raw_sample is unavailable: match the pixel
     rem format name (avoid 8-bit NV12/NV16 whose names contain "12"/"16").
-    echo %PF% | findstr /r "p10 p12 p14 p16 010 012 014 016" >nul && (
+    echo %PF% | findstr /r "p10 p12 p14 p16 010 012 014 016 210 216 410 10le 12le 14le 16le" >nul && (
         set "DEPTH=10"
         set "PIXFMT=yuv420p10le"
         set "FORMAT=yuv420p10le"
@@ -113,6 +113,7 @@ if "!DEPTH!"=="8" (
 set "VFILTER=scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=!FORMAT!"
 if defined SCALE set "VFILTER=scale=!SCALE!:flags=lanczos,format=!FORMAT!"
 
+echo == detected: pix_fmt=%PF%, bits_per_raw_sample=%BITS% -^> !DEPTH!-bit pipeline
 echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid^)
 
 set "TARGET_ARGS="
