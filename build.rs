@@ -77,15 +77,21 @@ fn main() {
             Ok(o) => {
                 let err = String::from_utf8_lossy(&o.stderr);
                 let stdout = String::from_utf8_lossy(&o.stdout);
-                let first = stdout
+                let mut lines: Vec<&str> = stdout
                     .lines()
                     .chain(err.lines())
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("(no compiler output)");
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                if lines.is_empty() {
+                    lines.push("(no compiler output)");
+                }
+                lines.truncate(6);
                 probe_error = Some(format!(
-                    "{} (exit {}): {first}",
+                    "{} (exit {}): {}",
                     cand.cxx.display(),
-                    o.status.code().unwrap_or(-1)
+                    o.status.code().unwrap_or(-1),
+                    lines.join(" | ")
                 ));
             }
             Err(e) => {
