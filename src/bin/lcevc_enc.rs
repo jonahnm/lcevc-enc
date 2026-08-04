@@ -214,7 +214,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut frames = u32::MAX;
     let mut base_mode = "raw".to_string();
     let mut sw_l1 = 512u32;
-    let mut sw_l2 = 128u32;
+    let mut sw_l2 = 256u32;
     let mut transform = TransformType::Dds;
     let mut upsampler = UpsampleType::Linear;
     let mut scaling_l1 = ScalingMode::Scale2D;

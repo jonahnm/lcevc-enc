@@ -202,7 +202,7 @@ set -o pipefail
         --scaling-l1 0 --scaling-l2 2 \
         --upsampler modified-cubic \
         --qm-beta 0.3 \
-        --step-width-l1 1024 --step-width-l2 256 \
+        --step-width-l1 1024 --step-width-l2 512 \
         --no-psnr \
         "${FRAMES_ARG[@]}" \
         "${GOP_ARGS[@]}" \
