@@ -137,19 +137,25 @@ if /i "%EXT%"==".mp4" (
     if exist "%TEMP%\lcevc_frames.txt" set /p TOTAL_FRAMES=<"%TEMP%\lcevc_frames.txt"
 )
 if not defined TOTAL_FRAMES (
-    rem fallback: duration x fps (integer arithmetic)
+    rem estimate: duration x fps. Probes go through temp files (like the
+    rem depth detection) because for /f commands break on filenames with
+    rem parentheses/brackets.
     set "DUR="
-    for /f "delims=." %%a in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "%INPUT%" 2^>nul') do set "DUR=%%a"
+    "%FFPROBE%" -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_dur.txt" 2>nul
+    if exist "%TEMP%\lcevc_dur.txt" set /p DUR=<"%TEMP%\lcevc_dur.txt"
+    if defined DUR for /f "delims=." %%a in ("!DUR!") do set "DUR=%%a"
+    set "FPS="
+    "%FFPROBE%" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_fps.txt" 2>nul
+    if exist "%TEMP%\lcevc_fps.txt" set /p FPS=<"%TEMP%\lcevc_fps.txt"
     set "FNUM="
     set "FDEN=1"
-    for /f "tokens=1,2 delims=/" %%n in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "%INPUT%" 2^>nul') do (
+    if defined FPS for /f "tokens=1,2 delims=/" %%n in ("!FPS!") do (
         set "FNUM=%%n"
         set "FDEN=%%m"
     )
-    if defined DUR if defined FNUM (
-        set /a TOTAL_FRAMES = DUR * FNUM / FDEN 2>nul
-    )
+    if defined DUR if defined FNUM set /a TOTAL_FRAMES=!DUR!*!FNUM!/!FDEN! 2>nul
 )
+del /q "%TEMP%\lcevc_dur.txt" "%TEMP%\lcevc_fps.txt" 2>nul
 set "FRAMES_ARG="
 if defined TOTAL_FRAMES if !TOTAL_FRAMES! GTR 0 set "FRAMES_ARG=--frames !TOTAL_FRAMES!"
 
