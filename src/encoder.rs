@@ -881,11 +881,15 @@ impl Encoder {
             1.0
         } else if (self.rc_prev_size as f64) < t / 20.0 {
             // The previous frame was adaptively dropped (config-only
-            // payload): that is not a size signal, so go finer to engage
-            // the residual rather than interpreting it as "too small".
-            0.7
+            // payload): that is not a size signal, so step gently finer
+            // to re-engage the residual without overshooting into the
+            // drop/overshoot oscillation.
+            0.9
         } else {
-            (self.rc_prev_size as f64 / t).powf(0.5).clamp(0.5, 2.0)
+            // Damped interpolation (size ~ C/sw^2): a tighter clamp keeps
+            // the step widths stable frame to frame so the adaptive drop
+            // does not oscillate; the target is tracked over a few frames.
+            (self.rc_prev_size as f64 / t).powf(0.5).clamp(0.8, 1.25)
         };
         let sw1 = ((self.rc_prev_sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
         let sw2 = ((self.rc_prev_sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
