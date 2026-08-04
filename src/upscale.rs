@@ -43,6 +43,140 @@ fn load_pel(src: &PlaneS16, src_x: i32, src_width: i32, y: usize) -> [i16; 8] {
     pel
 }
 
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn upscale_block_2d_avx2(
+    s0: &[i16; 8], s1: &[i16; 8], s2: &[i16; 8], s3: &[i16; 8], s4: &[i16; 8],
+    kernel: &[i16; 4],
+) -> ([i16; 8], [i16; 8]) {
+    use std::arch::x86_64::*;
+    let (k0, k1, k2, k3) = (kernel[0], kernel[1], kernel[2], kernel[3]);
+
+    // ---- Vertical pass (per-lane 4-tap via interleaved pairs) ----
+    let mut v0 = [0i16; 8];
+    let mut v1 = [0i16; 8];
+    for phase in 0..2 {
+        let (sa, sb, sc, sd, k_ab, k_cd) = if phase == 0 {
+            (s0, s1, s2, s3, (k3, k2), (k1, k0))
+        } else {
+            (s1, s2, s3, s4, (k0, k1), (k2, k3))
+        };
+        let (lo, hi) = if phase == 0 {
+            let il = _mm256_unpacklo_epi16(
+                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
+            );
+            let ih = _mm256_unpackhi_epi16(
+                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
+            );
+            let jl = _mm256_unpacklo_epi16(
+                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
+            );
+            let jh = _mm256_unpackhi_epi16(
+                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
+            );
+            let kab = _mm256_set1_epi16(k_ab.0);
+            let kab2 = _mm256_set1_epi16(k_ab.1);
+            let kcd = _mm256_set1_epi16(k_cd.0);
+            let kcd2 = _mm256_set1_epi16(k_cd.1);
+            let lo = _mm256_add_epi32(
+                _mm256_madd_epi16(il, _mm256_unpacklo_epi16(kab, kab2)),
+                _mm256_madd_epi16(jl, _mm256_unpacklo_epi16(kcd, kcd2)),
+            );
+            let hi = _mm256_add_epi32(
+                _mm256_madd_epi16(ih, _mm256_unpacklo_epi16(kab, kab2)),
+                _mm256_madd_epi16(jh, _mm256_unpacklo_epi16(kcd, kcd2)),
+            );
+            (lo, hi)
+        } else {
+            // phase 1: (s1,s2) and (s3,s4)
+            let il = _mm256_unpacklo_epi16(
+                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
+            );
+            let ih = _mm256_unpackhi_epi16(
+                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
+            );
+            let jl = _mm256_unpacklo_epi16(
+                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
+            );
+            let jh = _mm256_unpackhi_epi16(
+                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
+                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
+            );
+            let kab = _mm256_set1_epi16(k_ab.0);
+            let kab2 = _mm256_set1_epi16(k_ab.1);
+            let kcd = _mm256_set1_epi16(k_cd.0);
+            let kcd2 = _mm256_set1_epi16(k_cd.1);
+            let lo = _mm256_add_epi32(
+                _mm256_madd_epi16(il, _mm256_unpacklo_epi16(kab, kab2)),
+                _mm256_madd_epi16(jl, _mm256_unpacklo_epi16(kcd, kcd2)),
+            );
+            let hi = _mm256_add_epi32(
+                _mm256_madd_epi16(ih, _mm256_unpacklo_epi16(kab, kab2)),
+                _mm256_madd_epi16(jh, _mm256_unpacklo_epi16(kcd, kcd2)),
+            );
+            (lo, hi)
+        };
+        // round + shift, then pack (saturating) and store the 8 lanes
+        let rnd = _mm256_set1_epi32(0x2000);
+        let lo = _mm256_srai_epi32::<14>(_mm256_add_epi32(lo, rnd));
+        let hi = _mm256_srai_epi32::<14>(_mm256_add_epi32(hi, rnd));
+        let p = _mm256_packs_epi32(lo, hi);
+        let out = _mm256_castsi256_si128(p);
+        if phase == 0 {
+            _mm_storeu_si128(v0.as_mut_ptr() as *mut __m128i, out);
+        } else {
+            _mm_storeu_si128(v1.as_mut_ptr() as *mut __m128i, out);
+        }
+    }
+
+    // ---- Horizontal pass (convolve_horizontal on v0/v1) ----
+    let hcon = |v: &[i16; 8]| -> [i16; 8] {
+        let vv = _mm256_loadu_si256(v.as_ptr() as *const __m256i);
+        // vs1..vs4: the v shifted by 1..4 lanes (2 bytes per lane)
+        let vs1 = _mm256_srli_si256::<2>(vv);
+        let vs2 = _mm256_srli_si256::<4>(vv);
+        let vs3 = _mm256_srli_si256::<6>(vv);
+        let vs4 = _mm256_srli_si256::<8>(vv);
+        let k32 = _mm256_unpacklo_epi16(_mm256_set1_epi16(k3), _mm256_set1_epi16(k2));
+        let k10 = _mm256_unpacklo_epi16(_mm256_set1_epi16(k1), _mm256_set1_epi16(k0));
+        let k01 = _mm256_unpacklo_epi16(_mm256_set1_epi16(k0), _mm256_set1_epi16(k1));
+        let k23 = _mm256_unpacklo_epi16(_mm256_set1_epi16(k2), _mm256_set1_epi16(k3));
+        // odd: out[2i] = v[i]*k3 + v[i+1]*k2 + v[i+2]*k1 + v[i+3]*k0
+        let odd = _mm256_add_epi32(
+            _mm256_madd_epi16(_mm256_unpacklo_epi16(vv, vs1), k32),
+            _mm256_madd_epi16(_mm256_unpacklo_epi16(vs2, vs3), k10),
+        );
+        // even: out[2i+1] = v[i+1]*k0 + v[i+2]*k1 + v[i+3]*k2 + v[i+4]*k3
+        let even = _mm256_add_epi32(
+            _mm256_madd_epi16(_mm256_unpacklo_epi16(vs1, vs2), k01),
+            _mm256_madd_epi16(_mm256_unpacklo_epi16(vs3, vs4), k23),
+        );
+        let rnd = _mm256_set1_epi32(0x2000);
+        let odd = _mm256_srai_epi32::<14>(_mm256_add_epi32(odd, rnd));
+        let even = _mm256_srai_epi32::<14>(_mm256_add_epi32(even, rnd));
+        let p = _mm256_packs_epi32(odd, even);
+        // p low-128 = (odd0..3, even0..3); interleave with itself shifted
+        // by 4 lanes to get (odd0,even0,odd1,even1,...)
+        let plo = _mm256_castsi256_si128(p);
+        let ps = _mm_srli_si128::<8>(plo);
+        let out = _mm_unpacklo_epi16(plo, ps);
+        let mut row = [0i16; 8];
+        _mm_storeu_si128(row.as_mut_ptr() as *mut __m128i, out);
+        row
+    };
+    let row0 = hcon(&v0);
+    let row1 = hcon(&v1);
+    (row0, row1)
+}
+
 /// 2:1 horizontal upscale.
 pub fn upscale_1d(src: &PlaneS16, kernel: &[i16; 4], apply_pa: bool) -> PlaneS16 {
     let src_width = src.width as i32;
@@ -116,33 +250,87 @@ pub fn upscale_2d(src: &PlaneS16, kernel: &[i16; 4], apply_pa: bool) -> PlaneS16
             let block_src_x = if right_edge { right_edge_src_x } else { src_x };
             let dst_x = (block_src_x * 2) as usize;
 
-            let mut s0 = [0i16; 8];
-            let mut s1 = [0i16; 8];
-            let mut s2 = [0i16; 8];
-            let mut s3 = [0i16; 8];
-            let mut s4 = [0i16; 8];
-            for i in 0..8 {
-                let sx = (block_src_x - 2 + i as i32).clamp(0, src_width - 1) as usize;
-                s0[i] = src.get(sx, y0);
-                s1[i] = src.get(sx, y1);
-                s2[i] = src.get(sx, y2);
-                s3[i] = src.get(sx, y3);
-                s4[i] = src.get(sx, y4);
-            }
+            // Interior blocks (no edge clamping needed) use the SIMD path.
+            let interior = block_src_x >= 2 && block_src_x + 5 < src_width;
+            #[cfg(target_arch = "x86_64")]
+            let simd = interior && std::is_x86_feature_detected!("avx2");
+            #[cfg(not(target_arch = "x86_64"))]
+            let simd = false;
+            #[cfg(target_arch = "x86_64")]
+            let (mut row0, mut row1) = if simd {
+                let mut s0 = [0i16; 8];
+                let mut s1 = [0i16; 8];
+                let mut s2 = [0i16; 8];
+                let mut s3 = [0i16; 8];
+                let mut s4 = [0i16; 8];
+                let bx = block_src_x as usize;
+                let w = src_width as usize;
+                for i in 0..8 {
+                    s0[i] = src.get(bx - 2 + i, y0);
+                    s1[i] = src.get(bx - 2 + i, y1);
+                    s2[i] = src.get(bx - 2 + i, y2);
+                    s3[i] = src.get(bx - 2 + i, y3);
+                    s4[i] = src.get(bx - 2 + i, y4);
+                }
+                let _ = w;
+                unsafe { upscale_block_2d_avx2(&s0, &s1, &s2, &s3, &s4, kernel) }
+            } else {
+                let mut s0 = [0i16; 8];
+                let mut s1 = [0i16; 8];
+                let mut s2 = [0i16; 8];
+                let mut s3 = [0i16; 8];
+                let mut s4 = [0i16; 8];
+                for i in 0..8 {
+                    let sx = (block_src_x - 2 + i as i32).clamp(0, src_width - 1) as usize;
+                    s0[i] = src.get(sx, y0);
+                    s1[i] = src.get(sx, y1);
+                    s2[i] = src.get(sx, y2);
+                    s3[i] = src.get(sx, y3);
+                    s4[i] = src.get(sx, y4);
+                }
 
-            // Vertical pass.
-            let mut v0 = [0i16; 8];
-            let mut v1 = [0i16; 8];
-            for i in 0..8 {
-                let a0 = s0[i] as i32 * k(3) + s1[i] as i32 * k(2) + s2[i] as i32 * k(1) + s3[i] as i32 * k(0);
-                let a1 = s1[i] as i32 * k(0) + s2[i] as i32 * k(1) + s3[i] as i32 * k(2) + s4[i] as i32 * k(3);
-                v0[i] = shift_round_s15(a0);
-                v1[i] = shift_round_s15(a1);
-            }
+                // Vertical pass.
+                let mut v0 = [0i16; 8];
+                let mut v1 = [0i16; 8];
+                for i in 0..8 {
+                    let a0 = s0[i] as i32 * k(3) + s1[i] as i32 * k(2) + s2[i] as i32 * k(1) + s3[i] as i32 * k(0);
+                    let a1 = s1[i] as i32 * k(0) + s2[i] as i32 * k(1) + s3[i] as i32 * k(2) + s4[i] as i32 * k(3);
+                    v0[i] = shift_round_s15(a0);
+                    v1[i] = shift_round_s15(a1);
+                }
 
-            // Horizontal pass on both intermediate rows.
-            let row0 = convolve_horizontal(&v0, kernel);
-            let row1 = convolve_horizontal(&v1, kernel);
+                // Horizontal pass on both intermediate rows.
+                let row0 = convolve_horizontal(&v0, kernel);
+                let row1 = convolve_horizontal(&v1, kernel);
+                (row0, row1)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let (mut row0, mut row1) = {
+                let mut s0 = [0i16; 8];
+                let mut s1 = [0i16; 8];
+                let mut s2 = [0i16; 8];
+                let mut s3 = [0i16; 8];
+                let mut s4 = [0i16; 8];
+                for i in 0..8 {
+                    let sx = (block_src_x - 2 + i as i32).clamp(0, src_width - 1) as usize;
+                    s0[i] = src.get(sx, y0);
+                    s1[i] = src.get(sx, y1);
+                    s2[i] = src.get(sx, y2);
+                    s3[i] = src.get(sx, y3);
+                    s4[i] = src.get(sx, y4);
+                }
+                let mut v0 = [0i16; 8];
+                let mut v1 = [0i16; 8];
+                for i in 0..8 {
+                    let a0 = s0[i] as i32 * k(3) + s1[i] as i32 * k(2) + s2[i] as i32 * k(1) + s3[i] as i32 * k(0);
+                    let a1 = s1[i] as i32 * k(0) + s2[i] as i32 * k(1) + s3[i] as i32 * k(2) + s4[i] as i32 * k(3);
+                    v0[i] = shift_round_s15(a0);
+                    v1[i] = shift_round_s15(a1);
+                }
+                let row0 = convolve_horizontal(&v0, kernel);
+                let row1 = convolve_horizontal(&v1, kernel);
+                (row0, row1)
+            };
 
             let mut row0 = row0;
             let mut row1 = row1;
@@ -227,6 +415,44 @@ pub fn downscale_plane(src: &Plane, mode: ScalingMode, depth: u8) -> Plane {
         }
     }
     dst
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod simd_tests {
+    use super::*;
+
+    #[test]
+    fn upscale_block_avx2_matches_scalar() {
+        let kernel: [i16; 4] = [-2360, 15855, 4165, -1276];
+        for seed in 0..50u64 {
+            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let gen = |rng: &mut u64| -> i16 {
+                *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((*rng >> 33) % 65536) as i16
+            };
+            let s0 = [gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng)];
+            let s1 = [gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng)];
+            let s2 = [gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng)];
+            let s3 = [gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng)];
+            let s4 = [gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng)];
+            // scalar vertical + horizontal
+            let mut v0 = [0i16; 8];
+            let mut v1 = [0i16; 8];
+            for i in 0..8 {
+                let a0 = s0[i] as i32 * kernel[3] as i32 + s1[i] as i32 * kernel[2] as i32
+                    + s2[i] as i32 * kernel[1] as i32 + s3[i] as i32 * kernel[0] as i32;
+                let a1 = s1[i] as i32 * kernel[0] as i32 + s2[i] as i32 * kernel[1] as i32
+                    + s3[i] as i32 * kernel[2] as i32 + s4[i] as i32 * kernel[3] as i32;
+                v0[i] = shift_round_s15(a0);
+                v1[i] = shift_round_s15(a1);
+            }
+            let expected0 = convolve_horizontal(&v0, &kernel);
+            let expected1 = convolve_horizontal(&v1, &kernel);
+            let (got0, got1) = unsafe { upscale_block_2d_avx2(&s0, &s1, &s2, &s3, &s4, &kernel) };
+            assert_eq!(got0, expected0, "row0 seed {seed}");
+            assert_eq!(got1, expected1, "row1 seed {seed}");
+        }
+    }
 }
 
 #[cfg(test)]

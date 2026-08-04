@@ -335,6 +335,17 @@ fn encode_tu_residual(
             // Lambda ~ sw^2 tuned empirically (0.0625 absorbs the transform
             // orthogonality constant); a bit is worth ~ sw/2 of error.
             let lambda_q = (sw * sw) / 16;
+            // Fast path: with a zero level the zero cost is num^2 and any
+            // nonzero candidate costs at least lambda*bits (9 for a 1-byte
+            // value), so zero provably wins when num^2 <= lambda*9*d2.
+            // At coarse step widths most coefficients are zero, so this
+            // skips the whole candidate loop for the bulk of the layers.
+            if q0 == 0 {
+                let nu = num as u64;
+                if (nu as u128) * (nu as u128) <= ((lambda_q as u64) * 9 * d2) as u128 {
+                    continue;
+                }
+            }
             let mut best = q0;
             let mut best_cost = u128::MAX;
             let candidates: [i64; 3] = [q0 - 1, q0, q0 + 1];
