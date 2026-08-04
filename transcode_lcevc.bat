@@ -16,6 +16,7 @@ rem
 rem Options:
 rem   --target-kbps N       rate-control the enhancement toward N kbps
 rem   --keyframe-interval N keyframe (GOP) interval in seconds
+rem   --gop N               GOP size in frames (overrides --keyframe-interval)
 rem   --scale WxH           downscale the video before encoding
 rem   --audio               remux the source audio into the output MP4
 rem                         (stream copy, no re-encode)
@@ -50,6 +51,7 @@ if not defined OUT set "OUT=%~n1"
 set "TARGET="
 set "AUDIO=0"
 set "KEYFRAME="
+set "GOP="
 set "SCALE="
 set "EXTRA="
 :argloop
@@ -67,6 +69,12 @@ if "%~1"=="--audio" (
 )
 if "%~1"=="--keyframe-interval" (
     set "KEYFRAME=%~2"
+    shift
+    shift
+    goto argloop
+)
+if "%~1"=="--gop" (
+    set "GOP=%~2"
     shift
     shift
     goto argloop
@@ -119,14 +127,37 @@ set "VFILTER=scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=!FORMAT!"
 if defined SCALE set "VFILTER=scale=!SCALE!:flags=lanczos,format=!FORMAT!"
 
 echo == detected: pix_fmt=%PF%, bits_per_raw_sample=%BITS% -^> !DEPTH!-bit pipeline
-echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid^)
+
+rem --- detect the total frame count (for the N/M progress + ETA) ---
+set "TOTAL_FRAMES="
+"%FFPROBE%" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "%INPUT%" > "%TEMP%\lcevc_frames.txt" 2>nul
+if exist "%TEMP%\lcevc_frames.txt" set /p TOTAL_FRAMES=<"%TEMP%\lcevc_frames.txt"
+if not defined TOTAL_FRAMES (
+    rem fallback: duration x fps (integer arithmetic)
+    set "DUR="
+    for /f "delims=." %%a in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "%INPUT%" 2^>nul') do set "DUR=%%a"
+    set "FNUM="
+    set "FDEN=1"
+    for /f "tokens=1,2 delims=/" %%n in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "%INPUT%" 2^>nul') do (
+        set "FNUM=%%n"
+        set "FDEN=%%m"
+    )
+    if defined DUR if defined FNUM (
+        set /a TOTAL_FRAMES = DUR * FNUM / FDEN 2>nul
+    )
+)
+set "FRAMES_ARG="
+if defined TOTAL_FRAMES if !TOTAL_FRAMES! GTR 0 set "FRAMES_ARG=--frames !TOTAL_FRAMES!"
+
+echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid, !TOTAL_FRAMES! frames^)
 
 set "TARGET_ARGS="
 if defined TARGET set "TARGET_ARGS=--target-kbps !TARGET!"
 set "GOP_ARGS="
-if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAME!"
+if defined GOP set "GOP_ARGS=--base-gop !GOP!"
+if not defined GOP if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAME!"
 
-"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 256 --no-psnr !GOP_ARGS! !TARGET_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
+"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 256 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
 if errorlevel 1 (
     echo !! encode failed 1>&2
     exit /b 1

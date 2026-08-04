@@ -17,6 +17,7 @@
 #                         (default: fixed step widths 1024/256)
 #   --keyframe-interval N keyframe (GOP) interval in seconds; the base is
 #                         encoded per GOP (one vvenc invocation per group)
+#   --gop N               GOP size in frames (overrides --keyframe-interval)
 #   --scale WxH           downscale the video before encoding (e.g. 3840x2160
 #                         for an 8K source; an 8K encode is ~4x slower)
 #   --audio               remux the source audio into the output MP4 (needs
@@ -58,6 +59,7 @@ fi
 TARGET=""
 AUDIO=0
 KEYFRAME=""
+GOP=""
 SCALE=""
 ENCODE_ARGS=()
 while [ $# -gt 0 ]; do
@@ -72,6 +74,10 @@ while [ $# -gt 0 ]; do
             ;;
         --keyframe-interval)
             KEYFRAME="$2"
+            shift 2
+            ;;
+        --gop)
+            GOP="$2"
             shift 2
             ;;
         --scale)
@@ -140,7 +146,11 @@ if [ -n "$SCALE" ]; then
 fi
 
 GOP_ARGS=()
-[ -n "$KEYFRAME" ] && GOP_ARGS+=(--base-gop-seconds "$KEYFRAME")
+if [ -n "$GOP" ]; then
+    GOP_ARGS+=(--base-gop "$GOP")
+elif [ -n "$KEYFRAME" ]; then
+    GOP_ARGS+=(--base-gop-seconds "$KEYFRAME")
+fi
 
 echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, half-res pyramid, ${TOTAL_FRAMES:-?} frames) =="
 

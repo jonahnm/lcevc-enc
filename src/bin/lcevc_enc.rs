@@ -31,6 +31,138 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
     Ok((w.parse().map_err(|_| "bad width")?, h.parse().map_err(|_| "bad height")?))
 }
 
+/// Process one encoded frame: assemble the NAL, stats, dumps, status.
+#[allow(clippy::too_many_arguments)]
+fn process_encoded_frame(
+    encoded: &lcevc_enc::encoder::EncodedFrame,
+    frame: &lcevc_enc::frame::Picture,
+    frame_start: std::time::Instant,
+    cfg: &lcevc_enc::config::LcevcConfig,
+    bit_depth: u8,
+    frames: u32,
+    run_start: std::time::Instant,
+    no_psnr: bool,
+    frame_count: &mut u32,
+    total_bytes: &mut usize,
+    total_sse: &mut u64,
+    total_samples: &mut u64,
+    out_file: &mut std::fs::File,
+    base_dump: &mut Option<std::fs::File>,
+    recon_dump: &mut Option<std::fs::File>,
+) -> Result<(), String> {
+        let mut payloads = Vec::new();
+        if encoded.idr {
+            payloads.push((lcevc_enc::nal::BLOCK_SEQUENCE_CONFIG, cfg.write_sequence_config()));
+            payloads.push((lcevc_enc::nal::BLOCK_GLOBAL_CONFIG, cfg.write_global_config()));
+        }
+        payloads.push((lcevc_enc::nal::BLOCK_PICTURE_CONFIG, encoded.picture_config.clone()));
+        payloads.push((if cfg.is_tiled() { lcevc_enc::nal::BLOCK_ENCODED_DATA_TILED } else { lcevc_enc::nal::BLOCK_ENCODED_DATA }, encoded.encoded_data.clone()));
+
+        let nal = build_nal_unit(encoded.idr, &payloads);
+        let nal_bytes = nal.len();
+        out_file.write_all(&nal).map_err(|e| e.to_string())?;
+        *total_bytes += nal_bytes;
+
+        if let Some(f) = base_dump.as_mut() {
+            lcevc_enc::base::write_yuv420(&encoded.base_picture, bit_depth, f)
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(f) = recon_dump.as_mut() {
+            lcevc_enc::base::write_yuv420(&encoded.output, bit_depth, f)
+                .map_err(|e| e.to_string())?;
+        }
+
+        let psnr = if no_psnr {
+            f64::NAN
+        } else {
+            let mut frame_sse = 0u64;
+            let mut frame_samples = 0u64;
+            for p in 0..frame.planes.len() {
+                for (a, b) in frame.planes[p].data.iter().zip(encoded.output.planes[p].data.iter()) {
+                    let d = *a as i64 - *b as i64;
+                    frame_sse += (d * d) as u64;
+                    frame_samples += 1;
+                }
+            }
+            *total_sse += frame_sse;
+            *total_samples += frame_samples;
+            if frame_sse == 0 {
+                f64::INFINITY
+            } else {
+                let max_val = ((1u64 << bit_depth) - 1) as f64;
+                10.0 * (max_val * max_val * frame_samples as f64 / frame_sse as f64).log10()
+            }
+        };
+
+        let now = std::time::Instant::now();
+        let frame_secs = now.duration_since(frame_start).as_secs_f64();
+        let fps = if frame_secs > 0.0 { 1.0 / frame_secs } else { 0.0 };
+        let total_frames = *frame_count + 1;
+        let elapsed = now.duration_since(run_start).as_secs_f64();
+        let avg_fps = if elapsed > 0.0 { total_frames as f64 / elapsed } else { 0.0 };
+        let eta = if frames != u32::MAX && total_frames < frames && avg_fps > 0.0 {
+            format!(", ETA {:.0}s", (frames - total_frames) as f64 / avg_fps)
+        } else {
+            String::new()
+        };
+        let frames_total = if frames == u32::MAX { "?".to_string() } else { frames.to_string() };
+        if psnr.is_nan() {
+            eprintln!(
+                "frame {total_frames}/{}: {frame_secs:6.2} s ({fps:5.2} fps, avg {avg_fps:5.2}){eta}, \
+                 enhancement {nal_bytes:>6} bytes",
+                frames_total,
+            );
+        } else {
+            eprintln!(
+                "frame {total_frames}/{}: {frame_secs:6.2} s ({fps:5.2} fps, avg {avg_fps:5.2}){eta}, \
+                 enhancement {nal_bytes:>6} bytes, PSNR {psnr:.2} dB",
+                frames_total,
+            );
+        }
+        *frame_count += 1;
+        Ok(())
+}
+
+/// Encode one GOP's enhancement against its decoded base.
+fn process_gop(
+    gop_frames: &[lcevc_enc::frame::Picture],
+    decoded: &[lcevc_enc::frame::Picture],
+    target_kbps: Option<u32>,
+    fps: u32,
+    encoder: &mut lcevc_enc::encoder::Encoder,
+    cfg: &lcevc_enc::config::LcevcConfig,
+    bit_depth: u8,
+    frames: u32,
+    run_start: std::time::Instant,
+    no_psnr: bool,
+    frame_count: &mut u32,
+    total_bytes: &mut usize,
+    total_sse: &mut u64,
+    total_samples: &mut u64,
+    out_file: &mut std::fs::File,
+    base_dump: &mut Option<std::fs::File>,
+    recon_dump: &mut Option<std::fs::File>,
+) -> Result<(), String> {
+    for (f, base) in gop_frames.iter().zip(decoded.iter()) {
+        let frame_start = std::time::Instant::now();
+        let encoded = match target_kbps {
+            Some(kbps) => {
+                let target_bytes =
+                    ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1);
+                let (ef, _sw1, _sw2) = encoder.encode_frame_rc(f, base, target_bytes)?;
+                ef
+            }
+            None => encoder.encode_frame_with_base(f, base)?,
+        };
+        process_encoded_frame(
+            &encoded, f, frame_start, cfg, bit_depth, frames, run_start, no_psnr,
+            frame_count, total_bytes, total_sse, total_samples, out_file, base_dump,
+            recon_dump,
+        )?;
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Err(e) = run(&args) {
@@ -374,96 +506,19 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut verify_frames: Vec<lcevc_enc::frame::Picture> = Vec::new();
     let run_start = std::time::Instant::now();
 
-    // Process one encoded frame: assemble the NAL, stats, dumps, status.
-    let process_encoded = |encoded: &lcevc_enc::encoder::EncodedFrame,
-                               frame: &lcevc_enc::frame::Picture,
-                               frame_start: std::time::Instant,
-                               frame_count: &mut u32,
-                               total_bytes: &mut usize,
-                               total_sse: &mut u64,
-                               total_samples: &mut u64,
-                               out_file: &mut std::fs::File,
-                               base_dump: &mut Option<std::fs::File>,
-                               recon_dump: &mut Option<std::fs::File>|
-     -> Result<(), String> {
-        let mut payloads = Vec::new();
-        if encoded.idr {
-            payloads.push((lcevc_enc::nal::BLOCK_SEQUENCE_CONFIG, cfg.write_sequence_config()));
-            payloads.push((lcevc_enc::nal::BLOCK_GLOBAL_CONFIG, cfg.write_global_config()));
-        }
-        payloads.push((lcevc_enc::nal::BLOCK_PICTURE_CONFIG, encoded.picture_config.clone()));
-        payloads.push((if cfg.is_tiled() { lcevc_enc::nal::BLOCK_ENCODED_DATA_TILED } else { lcevc_enc::nal::BLOCK_ENCODED_DATA }, encoded.encoded_data.clone()));
-
-        let nal = build_nal_unit(encoded.idr, &payloads);
-        let nal_bytes = nal.len();
-        out_file.write_all(&nal).map_err(|e| e.to_string())?;
-        *total_bytes += nal_bytes;
-
-        if let Some(f) = base_dump.as_mut() {
-            lcevc_enc::base::write_yuv420(&encoded.base_picture, bit_depth, f)
-                .map_err(|e| e.to_string())?;
-        }
-        if let Some(f) = recon_dump.as_mut() {
-            lcevc_enc::base::write_yuv420(&encoded.output, bit_depth, f)
-                .map_err(|e| e.to_string())?;
-        }
-
-        let psnr = if no_psnr {
-            f64::NAN
-        } else {
-            let mut frame_sse = 0u64;
-            let mut frame_samples = 0u64;
-            for p in 0..frame.planes.len() {
-                for (a, b) in frame.planes[p].data.iter().zip(encoded.output.planes[p].data.iter()) {
-                    let d = *a as i64 - *b as i64;
-                    frame_sse += (d * d) as u64;
-                    frame_samples += 1;
-                }
-            }
-            *total_sse += frame_sse;
-            *total_samples += frame_samples;
-            if frame_sse == 0 {
-                f64::INFINITY
-            } else {
-                let max_val = ((1u64 << bit_depth) - 1) as f64;
-                10.0 * (max_val * max_val * frame_samples as f64 / frame_sse as f64).log10()
-            }
-        };
-
-        let now = std::time::Instant::now();
-        let frame_secs = now.duration_since(frame_start).as_secs_f64();
-        let fps = if frame_secs > 0.0 { 1.0 / frame_secs } else { 0.0 };
-        let total_frames = *frame_count + 1;
-        let elapsed = now.duration_since(run_start).as_secs_f64();
-        let avg_fps = if elapsed > 0.0 { total_frames as f64 / elapsed } else { 0.0 };
-        let eta = if frames != u32::MAX && total_frames < frames && avg_fps > 0.0 {
-            format!(", ETA {:.0}s", (frames - total_frames) as f64 / avg_fps)
-        } else {
-            String::new()
-        };
-        let frames_total = if frames == u32::MAX { "?".to_string() } else { frames.to_string() };
-        if psnr.is_nan() {
-            eprintln!(
-                "frame {total_frames}/{}: {frame_secs:6.2} s ({fps:5.2} fps, avg {avg_fps:5.2}){eta}, \
-                 enhancement {nal_bytes:>6} bytes",
-                frames_total,
-            );
-        } else {
-            eprintln!(
-                "frame {total_frames}/{}: {frame_secs:6.2} s ({fps:5.2} fps, avg {avg_fps:5.2}){eta}, \
-                 enhancement {nal_bytes:>6} bytes, PSNR {psnr:.2} dB",
-                frames_total,
-            );
-        }
-        *frame_count += 1;
-        Ok(())
-    };
-
     let gop_size = base_gop.max(1);
+    let depth = cfg.sample_depth();
+
+    // Pipelined GOP processing: the vvenc base encode of GOP N+1 runs on a
+    // worker thread while the enhancement of GOP N is encoded, hiding most
+    // of the base-codec time behind the enhancement work.
+    let mut read_frames: u32 = 0;
+    let mut base_task: Option<std::thread::JoinHandle<Result<Vec<lcevc_enc::frame::Picture>, String>>> = None;
+    let mut pending: Vec<lcevc_enc::frame::Picture> = Vec::new();
     'outer: loop {
         // Read one GOP of source frames.
         let mut gop_frames: Vec<lcevc_enc::frame::Picture> = Vec::new();
-        while gop_frames.len() < gop_size && frame_count as usize + gop_frames.len() < frames as usize {
+        while gop_frames.len() < gop_size && read_frames as usize + gop_frames.len() < frames as usize {
             let frame = match &mut frame_source {
                 FrameSource::Raw(f) => {
                     yuv::read_yuv420_frame_file(&mut **f, width as usize, height as usize, bit_depth)?
@@ -477,52 +532,79 @@ fn run(args: &[String]) -> Result<(), String> {
             if verify && verify_frames.len() < 2 {
                 verify_frames.push(frame.clone());
             }
+            read_frames += 1;
             gop_frames.push(frame);
         }
         if gop_frames.is_empty() {
             break 'outer;
         }
 
+        // Join the previous GOP's base task and enhance its frames.
+        if let Some(task) = base_task.take() {
+            let decoded = task.join().unwrap()?;
+            process_gop(
+                &pending, &decoded, target_kbps, fps, &mut encoder, &cfg, bit_depth,
+                frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
+                &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
+                &mut recon_dump,
+            )?;
+        }
+
         if base_mode == "vvc" && gop_size > 1 {
-            // Build the base GOP (downscaled base targets) and run one
-            // vvenc invocation with inter prediction, then encode each
-            // frame's enhancement against its decoded base.
-            let depth = cfg.sample_depth();
-            let mut base_gop: Vec<lcevc_enc::frame::Picture> = Vec::with_capacity(gop_frames.len());
-            for f in &gop_frames {
-                let (bw, bh) = {
-                    let d = cfg.loq_dimensions();
-                    (d[2].0 as usize, d[2].1 as usize)
-                };
-                let mut bp = lcevc_enc::frame::Picture::new(bw, bh, cfg.chroma);
-                for p in 0..cfg.num_planes() {
-                    let l1 = lcevc_enc::upscale::downscale_plane(&f.planes[p], cfg.scaling_l2, depth);
-                    let base_t = lcevc_enc::upscale::downscale_plane(&l1, cfg.scaling_l1, depth);
-                    bp.planes[p] = base_t;
-                }
-                base_gop.push(bp);
-            }
-            let base_out_opt = if base_out_path.is_empty() { None } else { Some(base_out_path.as_str()) };
-            let decoded = lcevc_enc::base::encode_decode_base_gop(&cfg, &base_gop, base_out_opt)?;
-            for (f, base) in gop_frames.iter().zip(decoded.iter()) {
-                let frame_start = std::time::Instant::now();
-                let encoded = match target_kbps {
-                    Some(kbps) => {
-                        let target_bytes = ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1);
-                        let (ef, _sw1, _sw2) = encoder.encode_frame_rc(f, base, target_bytes)?;
-                        ef
+            // Start the vvenc base encode of this GOP on a worker thread
+            // (the enhancement of the previous GOP is encoded meanwhile).
+            let cfg2 = cfg.clone();
+            let depth2 = depth;
+            let gop2 = gop_frames.clone();
+            let base_out_path2 = base_out_path.clone();
+            base_task = Some(std::thread::spawn(move || {
+                // Build the base GOP (downscaled base targets) and run one
+                // vvenc invocation with inter prediction.
+                let mut base_gop: Vec<lcevc_enc::frame::Picture> =
+                    Vec::with_capacity(gop2.len());
+                for f in &gop2 {
+                    let (bw, bh) = {
+                        let d = cfg2.loq_dimensions();
+                        (d[2].0 as usize, d[2].1 as usize)
+                    };
+                    let mut bp = lcevc_enc::frame::Picture::new(bw, bh, cfg2.chroma);
+                    for p in 0..cfg2.num_planes() {
+                        let l1 = lcevc_enc::upscale::downscale_plane(&f.planes[p], cfg2.scaling_l2, depth2);
+                        let base_t = lcevc_enc::upscale::downscale_plane(&l1, cfg2.scaling_l1, depth2);
+                        bp.planes[p] = base_t;
                     }
-                    None => encoder.encode_frame_with_base(f, base)?,
+                    base_gop.push(bp);
+                }
+                let base_out_opt = if base_out_path2.is_empty() {
+                    None
+                } else {
+                    Some(base_out_path2.as_str())
                 };
-                process_encoded(&encoded, f, frame_start, &mut frame_count, &mut total_bytes, &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump)?;
-            }
+                lcevc_enc::base::encode_decode_base_gop(&cfg2, &base_gop, base_out_opt)
+            }));
+            pending = gop_frames;
         } else {
             for f in &gop_frames {
                 let frame_start = std::time::Instant::now();
                 let encoded = encoder.encode_frame(f)?;
-                process_encoded(&encoded, f, frame_start, &mut frame_count, &mut total_bytes, &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump)?;
+                process_encoded_frame(
+                    &encoded, f, frame_start, &cfg, bit_depth, frames, run_start,
+                    no_psnr, &mut frame_count, &mut total_bytes, &mut total_sse,
+                    &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump,
+                )?;
             }
         }
+    }
+
+    // Finish the last GOP's base task.
+    if let Some(task) = base_task.take() {
+        let decoded = task.join().unwrap()?;
+        process_gop(
+            &pending, &decoded, target_kbps, fps, &mut encoder, &cfg, bit_depth,
+            frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
+            &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
+            &mut recon_dump,
+        )?;
     }
 
     let psnr = if no_psnr || total_sse == 0 {

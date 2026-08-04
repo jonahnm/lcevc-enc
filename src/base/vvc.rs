@@ -44,12 +44,13 @@ pub fn encode_decode_vvc_gop(
             }
         }
     }
-    let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
-    // NOTE: ffmpeg's -vvenc-params is a DICT option: the pairs are COLON
-    // separated and the keys are case-sensitive lowercase vvenc config keys
-    // ("internalbitdepth", "inputbitdepth", "threads", ...). mtprofile=3
-    // enables wavefront (WPP) + tiles (2 columns x 1 row, resolution
-    // dependent; degrades to WPP-only for small bases).
+    // libvvenc only accepts yuv420p10le input, so the base codec path always
+    // runs at 10-bit: 8-bit pipeline samples (0-255) pass through as raw u16
+    // values unchanged. NOTE: ffmpeg's -vvenc-params is a DICT option: the
+    // pairs are COLON separated with case-sensitive lowercase keys;
+    // mtprofile=3 enables wavefront (WPP) + tiles (2 columns x 1 row,
+    // resolution dependent; degrades to WPP-only for small bases).
+    let pix_fmt = "yuv420p10le";
     let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let run_ffmpeg = |params: &str, input: &[u8], log: &mut String| -> Result<Option<Vec<u8>>, String> {
         let mut child = std::process::Command::new("ffmpeg")
@@ -90,14 +91,14 @@ pub fn encode_decode_vvc_gop(
     // reject the key, so retry with the basic params in that case.
     let mut yuv = Vec::with_capacity(frames.len() * (width as usize * height as usize * 3 / 2) * 2);
     for frame in frames {
-        crate::base::write_yuv420(frame, depth, &mut yuv).map_err(|e| e.to_string())?;
+        crate::base::write_yuv420(frame, 10, &mut yuv).map_err(|e| e.to_string())?;
     }
     let mut ffmpeg_log = String::new();
     let mtp_params = format!(
-        "internalbitdepth={}:inputbitdepth={}:threads={}:mtprofile=3",
-        depth, depth, ncpu,
+        "internalbitdepth=10:inputbitdepth=10:threads={}:mtprofile=3",
+        ncpu,
     );
-    let base_params = format!("internalbitdepth={}:inputbitdepth={}:threads={}", depth, depth, ncpu);
+    let base_params = format!("internalbitdepth=10:inputbitdepth=10:threads={}", ncpu);
     let vvc = run_ffmpeg(&mtp_params, &yuv, &mut ffmpeg_log)?
         .or_else(|| run_ffmpeg(&base_params, &yuv, &mut ffmpeg_log).unwrap_or(None))
         .ok_or_else(|| format!("ffmpeg libvvenc gop encode failed:\n{ffmpeg_log}"))?;
@@ -144,7 +145,8 @@ pub fn encode_decode_vvc_gop(
         }
         output.stdout
     };
-    let bytes_per = if depth == 10 { 2usize } else { 1usize };
+    // The decode always outputs 10-bit raw (2 bytes per sample).
+    let bytes_per = 2usize;
     let n = width as usize * height as usize;
     let frame_bytes = (n + 2 * ((width as usize / 2) * (height as usize / 2))) * bytes_per;
     let mut out = Vec::with_capacity(frames.len());
@@ -154,22 +156,12 @@ pub fn encode_decode_vvc_gop(
         let mut off = 0usize;
         for plane in &mut pic.planes {
             let n = plane.data.len();
-            match depth {
-                8 => {
-                    for (dst, &b) in plane.data.iter_mut().zip(&chunk[off..off + n]) {
-                        *dst = b as u16;
-                    }
-                }
-                10 => {
-                    for (dst, pair) in plane
-                        .data
-                        .iter_mut()
-                        .zip(chunk[off..off + n * 2].chunks_exact(2))
-                    {
-                        *dst = u16::from_le_bytes([pair[0], pair[1]]);
-                    }
-                }
-                other => return Err(format!("unsupported depth {other}")),
+            for (dst, pair) in plane
+                .data
+                .iter_mut()
+                .zip(chunk[off..off + n * 2].chunks_exact(2))
+            {
+                *dst = u16::from_le_bytes([pair[0], pair[1]]);
             }
             off += n * bytes_per;
         }
@@ -197,7 +189,7 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
     // Write the base picture (8- or 10-bit).
     {
         let mut f = std::fs::File::create(&base_yuv).map_err(|e| e.to_string())?;
-        crate::base::write_yuv420(base, depth, &mut f).map_err(|e| e.to_string())?;
+        crate::base::write_yuv420(base, 10, &mut f).map_err(|e| e.to_string())?;
     }
 
     // Encode with libvvenc. `extra` carries vvenc options like
@@ -211,7 +203,7 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
             qp = v.to_string();
         }
     }
-    let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+    let pix_fmt = "yuv420p10le";
     let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let run_ffmpeg = |params: &str, log: &mut String| -> Result<bool, String> {
         let output = Command::new("ffmpeg")
@@ -238,10 +230,10 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
     };
     let mut ffmpeg_log = String::new();
     let mtp_params = format!(
-        "internalbitdepth={}:inputbitdepth={}:threads={}:mtprofile=3",
-        depth, depth, ncpu,
+        "internalbitdepth=10:inputbitdepth=10:threads={}:mtprofile=3",
+        ncpu,
     );
-    let base_params = format!("internalbitdepth={}:inputbitdepth={}:threads={}", depth, depth, ncpu);
+    let base_params = format!("internalbitdepth=10:inputbitdepth=10:threads={}", ncpu);
     let ok = run_ffmpeg(&mtp_params, &mut ffmpeg_log)?
         || (run_ffmpeg(&base_params, &mut ffmpeg_log)?);
     if !ok {
