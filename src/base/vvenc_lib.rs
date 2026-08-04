@@ -339,8 +339,6 @@ pub struct VvencLib {
     au: Box<VvencAccessUnit>,
     au_payload: Vec<u8>,
     frames_in: u64,
-    width: usize,
-    height: usize,
 }
 
 pub struct EncodedAu {
@@ -470,7 +468,7 @@ impl VvencLib {
         #[cfg(have_vvenc)]
         eprintln!("vvenc: using statically linked vvenc {VVENC_VERSION}");
         #[cfg(not(have_vvenc))]
-        eprintln!("vvenc: using runtime-loaded library");
+        eprintln!("vvenc: using runtime-loaded library (expected vvenc {VVENC_VERSION})");
 
         // Payload buffer large enough for any coded AU at these dimensions.
         let payload_cap = width * height * 2;
@@ -479,6 +477,7 @@ impl VvencLib {
         au.payload = au_payload.as_ptr() as *mut u8;
         au.payload_size = payload_cap as i32;
 
+        let _ = (width, height);
         Ok(VvencLib {
             _lib: lib,
             enc,
@@ -486,8 +485,6 @@ impl VvencLib {
             au,
             au_payload,
             frames_in: 0,
-            width,
-            height,
         })
     }
 

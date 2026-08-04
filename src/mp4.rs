@@ -82,7 +82,7 @@ pub fn split_aus(base: &[u8]) -> Vec<(usize, usize)> {
     }
     let mut aus = Vec::with_capacity(vcl.len());
     let mut start = 0usize;
-    for (i, &v) in vcl.iter().enumerate() {
+    for (i, _) in vcl.iter().enumerate() {
         let end = if i + 1 < vcl.len() { vcl[i + 1] } else { base.len() };
         aus.push((start, end - start));
         start = end;

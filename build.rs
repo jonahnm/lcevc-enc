@@ -12,6 +12,9 @@ const VVENC_VERSION: &str = "1.14.0";
 fn main() {
     println!("cargo:rerun-if-changed=vendor/vvenc");
     println!("cargo:rerun-if-env-changed=VVENC_SOURCE");
+    println!("cargo:rustc-check-cfg=cfg(have_vvenc)");
+    let status_file = PathBuf::from(env::var("OUT_DIR").unwrap()).join("vvenc-build-status.txt");
+    let mut status = String::new();
 
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendor = env::var_os("VVENC_SOURCE")
@@ -19,12 +22,16 @@ fn main() {
         .unwrap_or_else(|| root.join("vendor").join("vvenc"));
     let src_lib = vendor.join("source").join("Lib");
     if !src_lib.join("vvenc").join("vvenc.cpp").exists() {
-        eprintln!("build.rs: vendored vvenc source not found at {}", src_lib.display());
+        let msg = format!("vendored vvenc source not found at {}", src_lib.display());
+        eprintln!("build.rs: {msg}");
         eprintln!("build.rs: lcevc-enc will load libvvenc at runtime instead");
+        finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
     }
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    status.push_str(&format!("vendored vvenc: {}
+", VVENC_VERSION));
     let target = env::var("TARGET").unwrap();
 
     // version.h is generated from version.h.in by the vvenc build.
@@ -41,16 +48,24 @@ fn main() {
 
     let files = collect_sources(&src_lib, arch);
     if files.is_empty() {
-        eprintln!("build.rs: no vvenc sources collected");
+        let msg = "no vvenc sources collected".to_string();
+        eprintln!("build.rs: {msg}");
+        finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
     }
+    status.push_str(&format!("sources: {} files
+", files.len()));
 
     // Locate the C++ compiler.
     let compiler = find_compiler(&target);
     let Some(cc) = compiler else {
-        eprintln!("build.rs: no C++ compiler found; using runtime libvvenc instead");
+        let msg = "no C++ compiler found (tried PATH cl, vswhere, VS install roots)".to_string();
+        eprintln!("build.rs: {msg}");
+        finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
     };
+    status.push_str(&format!("compiler: {}
+", cc.cxx.display()));
 
     let objdir = out.join("vvenc_obj");
     std::fs::create_dir_all(&objdir).ok();
@@ -74,15 +89,23 @@ fn main() {
         eprintln!("build.rs: vvenc produced only {} objects; treating as failure", objs.len());
         failed = true;
     }
+    if !failed {
+        status.push_str(&format!("objects: {}
+", objs.len()));
+    }
     if failed {
-        eprintln!("build.rs: vvenc static build failed; using runtime libvvenc instead");
+        let msg = format!("vvenc static build failed (see the compile errors above)");
+        eprintln!("build.rs: {msg}; using runtime libvvenc instead");
+        finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
     }
 
     // Archive into libvvenc_static.
     let lib = out.join(format!("libvvenc_static{}", cc.archive_suffix()));
     if !cc.archive(&lib, &objs) {
-        eprintln!("build.rs: archiving vvenc failed; using runtime libvvenc instead");
+        let msg = "archiving vvenc failed".to_string();
+        eprintln!("build.rs: {msg}; using runtime libvvenc instead");
+        finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
     }
 
@@ -91,6 +114,13 @@ fn main() {
     cc.link_runtime();
     println!("cargo:rustc-cfg=have_vvenc");
     eprintln!("build.rs: linked vendored vvenc {VVENC_VERSION} statically");
+    finish_status(&status_file, "OK: vendored vvenc linked statically");
+}
+
+fn finish_status(path: &Path, line: &str) {
+    let _ = std::fs::write(path, format!("{line}
+"));
+    eprintln!("build.rs: {line} (see {})", path.display());
 }
 
 #[derive(Clone, Copy)]
@@ -369,7 +399,7 @@ impl Compiler {
 fn find_compiler(target: &str) -> Option<Compiler> {
     if target.contains("windows") {
         // 1. cl.exe already on PATH (a VS developer prompt).
-        if let Ok(_) = Command::new("cl").arg("/?") .status() {
+        if let Ok(_) = Command::new("cl").arg("/?").status() {
             return Some(Compiler {
                 kind: CompilerKind::Msvc,
                 cxx: PathBuf::from("cl"),
@@ -383,6 +413,19 @@ fn find_compiler(target: &str) -> Option<Compiler> {
                 cxx: cl,
                 env,
             });
+        }
+        // 3. Probe the well-known install roots directly (no vswhere).
+        for root in [
+            r"C:\Program Files (x86)\Microsoft Visual Studio",
+            r"C:\Program Files\Microsoft Visual Studio",
+        ] {
+            if let Some((cl, env)) = scan_vs_root(root) {
+                return Some(Compiler {
+                    kind: CompilerKind::Msvc,
+                    cxx: cl,
+                    env,
+                });
+            }
         }
         None
     } else {
@@ -399,11 +442,110 @@ fn find_compiler(target: &str) -> Option<Compiler> {
     }
 }
 
+/// Find cl.exe + the SDK environment by walking the Visual Studio roots,
+/// independent of vswhere.
+fn scan_vs_root(root: &str) -> Option<(PathBuf, Vec<(String, String)>)> {
+    let root = Path::new(root);
+    if !root.is_dir() {
+        return None;
+    }
+    // <root>/<edition>/VC/Tools/MSVC/<ver>/bin/Host<x64>/x64/cl.exe
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for edition in rd.filter_map(|e| e.ok()) {
+            let vc = edition.path().join("VC").join("Tools").join("MSVC");
+            if let Ok(tools) = std::fs::read_dir(&vc) {
+                for ver in tools.filter_map(|e| e.ok()) {
+                    let bin = ver.path().join("bin");
+                    if let Ok(hosts) = std::fs::read_dir(&bin) {
+                        for host in hosts.filter_map(|e| e.ok()) {
+                            let cl = host.path().join("x64").join("cl.exe");
+                            if cl.exists() {
+                                candidates.push(cl);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Newest MSVC version first.
+    candidates.sort_by(|a, b| b.cmp(a));
+    let cl = candidates.into_iter().next()?;
+    let vc_root = cl
+        .parent()?
+        .parent()?
+        .parent()?
+        .parent()?
+        .to_path_buf();
+    let sdk = find_sdk()?;
+    let (include, lib) = sdk_paths(&vc_root, &sdk)?;
+    let join = |paths: &[PathBuf]| -> String {
+        paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    Some((
+        cl,
+        vec![
+            ("INCLUDE".to_string(), join(&include)),
+            ("LIB".to_string(), join(&lib)),
+        ],
+    ))
+}
+
+/// Returns the Windows SDK root and the newest version directory name.
+fn find_sdk() -> Option<(PathBuf, String)> {
+    for base in [
+        r"C:\Program Files (x86)\Windows Kits\10",
+        r"C:\Program Files\Windows Kits\10",
+    ] {
+        let base = Path::new(base);
+        if let Ok(rd) = std::fs::read_dir(base.join("Include")) {
+            let mut vers: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_str().map(String::from))
+                .filter(|n| n.starts_with("10."))
+                .collect();
+            vers.sort();
+            if let Some(v) = vers.pop() {
+                return Some((base.to_path_buf(), v));
+            }
+        }
+    }
+    None
+}
+
+fn sdk_paths(vc_root: &Path, sdk: &(PathBuf, String)) -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let (root, ver) = sdk;
+    let inc = vec![
+        vc_root.join("include"),
+        root.join("Include").join(ver).join("ucrt"),
+        root.join("Include").join(ver).join("um"),
+        root.join("Include").join(ver).join("shared"),
+    ];
+    let lib = vec![
+        vc_root.join("lib").join("x64"),
+        root.join("Lib").join(ver).join("ucrt").join("x64"),
+        root.join("Lib").join(ver).join("um").join("x64"),
+    ];
+    // Keep only directories that exist.
+    let inc: Vec<PathBuf> = inc.into_iter().filter(|p| p.is_dir()).collect();
+    let lib: Vec<PathBuf> = lib.into_iter().filter(|p| p.is_dir()).collect();
+    if inc.is_empty() || lib.is_empty() {
+        return None;
+    }
+    Some((inc, lib))
+}
+
 /// Locate the MSVC C++ tools and Windows SDK via vswhere, returning
 /// cl.exe and the INCLUDE/LIB environment it needs.
 fn msvc_vswhere() -> Option<(PathBuf, Vec<(String, String)>)> {
     let vswhere = r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe";
     if !Path::new(vswhere).exists() {
+        eprintln!("build.rs: vswhere not found at {vswhere}");
         return None;
     }
     let out = Command::new(vswhere)
@@ -417,34 +559,32 @@ fn msvc_vswhere() -> Option<(PathBuf, Vec<(String, String)>)> {
             // HostX64 vs Hostx64 casing varies; use a wildcard.
             r"VC\Tools\MSVC\**\bin\Host*\x64\cl.exe",
         ])
-        .output()
-        .ok()?;
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("build.rs: vswhere failed to run: {e}");
+            return None;
+        }
+    };
     let cl_path = String::from_utf8_lossy(&out.stdout)
         .lines()
-        .next()?
+        .next()
+        .unwrap_or("")
         .trim()
         .to_string();
     if cl_path.is_empty() {
+        eprintln!(
+            "build.rs: vswhere found no cl.exe (stderr: {})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
         return None;
     }
     let cl = PathBuf::from(&cl_path);
     // VC tools root: ...\VC\Tools\MSVC\<ver>\
     let vc_root = cl.parent()?.parent()?.parent()?.parent()?.to_path_buf();
-    let sdk_root = r"C:\Program Files (x86)\Windows Kits\10";
-    // Newest SDK version present.
-    let sdk_ver = std::fs::read_dir(format!(r"{sdk_root}\Include"))
-        .ok()?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_str().map(String::from))
-        .filter(|n| n.starts_with("10."))
-        .max()?;
-    let mut include = vec![vc_root.join("include")];
-    include.push(PathBuf::from(format!(r"{sdk_root}\Include\{sdk_ver}\ucrt")));
-    include.push(PathBuf::from(format!(r"{sdk_root}\Include\{sdk_ver}\um")));
-    include.push(PathBuf::from(format!(r"{sdk_root}\Include\{sdk_ver}\shared")));
-    let mut lib = vec![vc_root.join("lib").join("x64")];
-    lib.push(PathBuf::from(format!(r"{sdk_root}\Lib\{sdk_ver}\ucrt\x64")));
-    lib.push(PathBuf::from(format!(r"{sdk_root}\Lib\{sdk_ver}\um\x64")));
+    let sdk = find_sdk()?;
+    let (include, lib) = sdk_paths(&vc_root, &sdk)?;
     let join = |paths: &[PathBuf]| -> String {
         paths
             .iter()
@@ -452,9 +592,11 @@ fn msvc_vswhere() -> Option<(PathBuf, Vec<(String, String)>)> {
             .collect::<Vec<_>>()
             .join(";")
     };
-    let env = vec![
-        ("INCLUDE".to_string(), join(&include)),
-        ("LIB".to_string(), join(&lib)),
-    ];
-    Some((cl, env))
+    Some((
+        cl,
+        vec![
+            ("INCLUDE".to_string(), join(&include)),
+            ("LIB".to_string(), join(&lib)),
+        ],
+    ))
 }
