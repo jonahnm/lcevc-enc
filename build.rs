@@ -75,8 +75,15 @@ fn main() {
                 break;
             }
             Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let first = stdout
+                    .lines()
+                    .chain(err.lines())
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("(no compiler output)");
                 probe_error = Some(format!(
-                    "{} (exit {})",
+                    "{} (exit {}): {first}",
                     cand.cxx.display(),
                     o.status.code().unwrap_or(-1)
                 ));
