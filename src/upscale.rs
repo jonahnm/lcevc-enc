@@ -49,7 +49,7 @@ fn load_pel(src: &PlaneS16, src_x: i32, src_width: i32, y: usize) -> [i16; 8] {
 unsafe fn upscale_block_2d_avx2(
     s0: &[i16; 8], s1: &[i16; 8], s2: &[i16; 8], s3: &[i16; 8], s4: &[i16; 8],
     kernel: &[i16; 4],
-) -> ([i16; 8], [i16; 8]) {
+) -> ([i16; 8], [i16; 8], [i16; 8], [i16; 8]) {
     use std::arch::x86_64::*;
     let (k0, k1, k2, k3) = (kernel[0], kernel[1], kernel[2], kernel[3]);
     // [i16; 8] is 16 bytes; loadu_si256 would read 32 bytes of stack
@@ -156,7 +156,7 @@ unsafe fn upscale_block_2d_avx2(
     };
     let row0 = hcon(&v0);
     let row1 = hcon(&v1);
-    (row0, row1)
+    (row0, row1, v0, v1)
 }
 
 /// 2:1 horizontal upscale.
@@ -255,7 +255,8 @@ pub fn upscale_2d(src: &PlaneS16, kernel: &[i16; 4], apply_pa: bool) -> PlaneS16
                     s4[i] = src.get(bx - 2 + i, y4);
                 }
                 let _ = w;
-                unsafe { upscale_block_2d_avx2(&s0, &s1, &s2, &s3, &s4, kernel) }
+                let (r0, r1, _, _) = unsafe { upscale_block_2d_avx2(&s0, &s1, &s2, &s3, &s4, kernel) };
+                (r0, r1)
             } else {
                 let mut s0 = [0i16; 8];
                 let mut s1 = [0i16; 8];
@@ -432,7 +433,9 @@ mod simd_tests {
             }
             let expected0 = convolve_horizontal(&v0, &kernel);
             let expected1 = convolve_horizontal(&v1, &kernel);
-            let (got0, got1) = unsafe { upscale_block_2d_avx2(&s0, &s1, &s2, &s3, &s4, &kernel) };
+            let (got0, got1, gotv0, gotv1) = unsafe { upscale_block_2d_avx2(&s0, &s1, &s2, &s3, &s4, &kernel) };
+            assert_eq!(gotv0, v0, "v0 seed {seed}");
+            assert_eq!(gotv1, v1, "v1 seed {seed}");
             assert_eq!(got0, expected0, "row0 seed {seed}");
             assert_eq!(got1, expected1, "row1 seed {seed}");
         }
