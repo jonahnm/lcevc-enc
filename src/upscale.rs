@@ -52,6 +52,12 @@ unsafe fn upscale_block_2d_avx2(
 ) -> ([i16; 8], [i16; 8]) {
     use std::arch::x86_64::*;
     let (k0, k1, k2, k3) = (kernel[0], kernel[1], kernel[2], kernel[3]);
+    // [i16; 8] is 16 bytes; loadu_si256 would read 32 bytes of stack
+    // garbage, so load 128-bit and zero-extend.
+    let load8 = |p: &[i16; 8]| -> __m256i {
+        let v = _mm_loadu_si128(p.as_ptr() as *const __m128i);
+        _mm256_inserti128_si256(_mm256_setzero_si256(), v, 0)
+    };
 
     // ---- Vertical pass (per-lane 4-tap via interleaved pairs) ----
     let mut v0 = [0i16; 8];
@@ -63,22 +69,10 @@ unsafe fn upscale_block_2d_avx2(
             (s1, s2, s3, s4, (k0, k1), (k2, k3))
         };
         let (lo, hi) = if phase == 0 {
-            let il = _mm256_unpacklo_epi16(
-                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
-            );
-            let ih = _mm256_unpackhi_epi16(
-                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
-            );
-            let jl = _mm256_unpacklo_epi16(
-                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
-            );
-            let jh = _mm256_unpackhi_epi16(
-                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
-            );
+            let il = _mm256_unpacklo_epi16(load8(sa), load8(sb));
+            let ih = _mm256_unpackhi_epi16(load8(sa), load8(sb));
+            let jl = _mm256_unpacklo_epi16(load8(sc), load8(sd));
+            let jh = _mm256_unpackhi_epi16(load8(sc), load8(sd));
             let kab = _mm256_set1_epi16(k_ab.0);
             let kab2 = _mm256_set1_epi16(k_ab.1);
             let kcd = _mm256_set1_epi16(k_cd.0);
@@ -94,22 +88,10 @@ unsafe fn upscale_block_2d_avx2(
             (lo, hi)
         } else {
             // phase 1: (s1,s2) and (s3,s4)
-            let il = _mm256_unpacklo_epi16(
-                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
-            );
-            let ih = _mm256_unpackhi_epi16(
-                _mm256_loadu_si256(sa.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sb.as_ptr() as *const __m256i),
-            );
-            let jl = _mm256_unpacklo_epi16(
-                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
-            );
-            let jh = _mm256_unpackhi_epi16(
-                _mm256_loadu_si256(sc.as_ptr() as *const __m256i),
-                _mm256_loadu_si256(sd.as_ptr() as *const __m256i),
-            );
+            let il = _mm256_unpacklo_epi16(load8(sa), load8(sb));
+            let ih = _mm256_unpackhi_epi16(load8(sa), load8(sb));
+            let jl = _mm256_unpacklo_epi16(load8(sc), load8(sd));
+            let jh = _mm256_unpackhi_epi16(load8(sc), load8(sd));
             let kab = _mm256_set1_epi16(k_ab.0);
             let kab2 = _mm256_set1_epi16(k_ab.1);
             let kcd = _mm256_set1_epi16(k_cd.0);
@@ -139,7 +121,7 @@ unsafe fn upscale_block_2d_avx2(
 
     // ---- Horizontal pass (convolve_horizontal on v0/v1) ----
     let hcon = |v: &[i16; 8]| -> [i16; 8] {
-        let vv = _mm256_loadu_si256(v.as_ptr() as *const __m256i);
+        let vv = load8(v);
         // vs1..vs4: the v shifted by 1..4 lanes (2 bytes per lane)
         let vs1 = _mm256_srli_si256::<2>(vv);
         let vs2 = _mm256_srli_si256::<4>(vv);
