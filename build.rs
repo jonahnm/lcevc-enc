@@ -220,6 +220,9 @@ fn include_dirs(vendor: &Path, out: &Path) -> Vec<PathBuf> {
     for d in ["arm", "arm/neon", "arm/sve", "arm/sve2"] {
         dirs.push(lib.join("CommonLib").join(d));
     }
+    // The x86 headers use simde (SIMD Everywhere) on MSVC; the include
+    // root for `simde/x86/sse2.h` is the vendored thirdparty dir.
+    dirs.push(vendor.join("thirdparty"));
     dirs
 }
 
