@@ -62,30 +62,45 @@ pub fn encode_decode_vvc_gop(
     // ("internalbitdepth", "inputbitdepth", "threads", ...). mtprofile=3
     // enables wavefront (WPP) + tiles (2 columns x 1 row, resolution
     // dependent; degrades to WPP-only for small bases).
-    let vvenc_params = format!(
+    let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let run_ffmpeg = |params: &str, log: &mut String| -> Result<bool, String> {
+        let output = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "rawvideo", "-pix_fmt", pix_fmt,
+                "-s", &format!("{width}x{height}"),
+                "-r", "25",
+                "-i", base_yuv.to_str().unwrap(),
+                "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
+                "-vvenc-params", params,
+                base_vvc.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|e| format!("failed to run ffmpeg (libvvenc gop): {e}"))?;
+        if !output.status.success() {
+            *log = String::from_utf8_lossy(&output.stderr).into_owned();
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    };
+    // mtprofile=3 enables wavefront (WPP) + tiles; older libvvenc builds
+    // reject the key, so retry with the basic params in that case.
+    let mut ffmpeg_log = String::new();
+    let mtp_params = format!(
         "internalbitdepth={}:inputbitdepth={}:threads={}:mtprofile=3",
-        depth, depth,
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+        depth, depth, ncpu,
     );
-
-    let status = std::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "rawvideo", "-pix_fmt", pix_fmt,
-            "-s", &format!("{width}x{height}"),
-            "-r", "25",
-            "-i", base_yuv.to_str().unwrap(),
-            "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
-            "-vvenc-params", &vvenc_params,
-            base_vvc.to_str().unwrap(),
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to run ffmpeg (libvvenc gop): {e}"))?;
-    if !status.success() {
-        return Err("ffmpeg libvvenc gop encode failed".into());
+    let base_params = format!("internalbitdepth={}:inputbitdepth={}:threads={}", depth, depth, ncpu);
+    let ok = run_ffmpeg(&mtp_params, &mut ffmpeg_log)?
+        || (run_ffmpeg(&base_params, &mut ffmpeg_log)?);
+    if !ok {
+        return Err(format!(
+            "ffmpeg libvvenc gop encode failed:\n{ffmpeg_log}"
+        ));
     }
     if let Some(path) = base_out {
         use std::io::Write;
@@ -184,28 +199,40 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
         }
     }
     let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
-    let vvenc_params = format!(
+    let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let run_ffmpeg = |params: &str, log: &mut String| -> Result<bool, String> {
+        let output = Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "rawvideo", "-pix_fmt", pix_fmt,
+                "-s", &format!("{width}x{height}"),
+                "-i", base_yuv.to_str().unwrap(),
+                "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
+                "-vvenc-params", params,
+                base_vvc.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("failed to run ffmpeg (libvvenc): {e}"))?;
+        if !output.status.success() {
+            *log = String::from_utf8_lossy(&output.stderr).into_owned();
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    };
+    let mut ffmpeg_log = String::new();
+    let mtp_params = format!(
         "internalbitdepth={}:inputbitdepth={}:threads={}:mtprofile=3",
-        depth, depth,
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+        depth, depth, ncpu,
     );
-    let status = Command::new("ffmpeg")
-        .args([
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "rawvideo", "-pix_fmt", pix_fmt,
-            "-s", &format!("{width}x{height}"),
-            "-i", base_yuv.to_str().unwrap(),
-            "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
-            "-vvenc-params", &vvenc_params,
-            base_vvc.to_str().unwrap(),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("failed to run ffmpeg (libvvenc): {e}"))?;
-    if !status.success() {
-        return Err("ffmpeg libvvenc encode failed".into());
+    let base_params = format!("internalbitdepth={}:inputbitdepth={}:threads={}", depth, depth, ncpu);
+    let ok = run_ffmpeg(&mtp_params, &mut ffmpeg_log)?
+        || (run_ffmpeg(&base_params, &mut ffmpeg_log)?);
+    if !ok {
+        return Err(format!("ffmpeg libvvenc encode failed:\n{ffmpeg_log}"));
     }
     if let Some(path) = base_out {
         // Append this frame's bitstream to the output file (each call

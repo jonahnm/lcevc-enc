@@ -92,9 +92,14 @@ set "DEPTH=8"
 set "PIXFMT=yuv420p"
 set "FORMAT=yuv420p"
 set "PF="
-for /f "delims=" %%i in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "%INPUT%" 2^>nul') do set "PF=%%i"
 set "BITS="
-for /f "delims=" %%i in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of csv=p=0 "%INPUT%" 2^>nul') do set "BITS=%%i"
+rem Use temp files instead of for /f: cmd's for /f parsing breaks on
+rem filenames containing parentheses/brackets.
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "%INPUT%" > "%TEMP%\lcevc_pf.txt" 2>nul
+if exist "%TEMP%\lcevc_pf.txt" set /p PF=<"%TEMP%\lcevc_pf.txt"
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of csv=p=0 "%INPUT%" > "%TEMP%\lcevc_bits.txt" 2>nul
+if exist "%TEMP%\lcevc_bits.txt" set /p BITS=<"%TEMP%\lcevc_bits.txt"
+del /q "%TEMP%\lcevc_pf.txt" "%TEMP%\lcevc_bits.txt" 2>nul
 echo !BITS! | findstr /r "10 12 14 16" >nul && (
     set "DEPTH=10"
     set "PIXFMT=yuv420p10le"
