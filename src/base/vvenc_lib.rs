@@ -214,6 +214,19 @@ impl Default for VvencConfig {
     }
 }
 
+// vsnprintf lives in the UCRT on MSVC; rustc does not link ucrt by
+// default, so request it explicitly there (unix/windows-gnu resolve it
+// from the default CRT import libraries).
+#[cfg(all(windows, target_env = "msvc"))]
+#[link(name = "ucrt")]
+extern "C" {
+    fn vsnprintf(s: *mut std::ffi::c_char, n: usize, fmt: *const std::ffi::c_char, ap: *mut std::ffi::c_void) -> std::ffi::c_int;
+}
+#[cfg(not(all(windows, target_env = "msvc")))]
+extern "C" {
+    fn vsnprintf(s: *mut std::ffi::c_char, n: usize, fmt: *const std::ffi::c_char, ap: *mut std::ffi::c_void) -> std::ffi::c_int;
+}
+
 // ---------------------------------------------------------------------------
 // logging callback
 
@@ -232,10 +245,6 @@ extern "C" fn vvenc_msg_cb(
     fmt: *const std::ffi::c_char,
     args: *mut std::ffi::c_void,
 ) {
-    use std::ffi::c_int;
-    extern "C" {
-        fn vsnprintf(s: *mut std::ffi::c_char, n: usize, fmt: *const std::ffi::c_char, ap: *mut std::ffi::c_void) -> c_int;
-    }
     if level < 1 {
         return;
     }
