@@ -103,28 +103,87 @@ mod dynlib {
     }
 }
 
+// When the vendored vvenc was linked statically (build.rs emitted
+// `cargo:rustc-cfg=have_vvenc`), the symbols resolve directly; otherwise
+// the library is loaded at runtime.
+#[cfg(have_vvenc)]
+extern "C" {
+    fn vvenc_init_default(
+        c: *mut VvencConfig, w: i32, h: i32, fps: i32, br: i32, qp: i32, preset: i32,
+    ) -> i32;
+    fn vvenc_set_param(c: *mut VvencConfig, n: *const std::ffi::c_char, v: *const std::ffi::c_char) -> i32;
+    fn vvenc_set_msg_callback(c: *mut VvencConfig, ctx: *mut std::ffi::c_void, f: Option<VvencMsgFn>) -> std::ffi::c_void;
+    fn vvenc_encoder_create() -> *mut std::ffi::c_void;
+    fn vvenc_encoder_open(e: *mut std::ffi::c_void, c: *mut VvencConfig) -> i32;
+    fn vvenc_get_headers(e: *mut std::ffi::c_void, au: *mut VvencAccessUnit) -> i32;
+    fn vvenc_encode(e: *mut std::ffi::c_void, y: *const VvencYuvBuffer, au: *mut VvencAccessUnit, done: *mut bool) -> i32;
+    fn vvenc_encoder_close(e: *mut std::ffi::c_void) -> i32;
+    fn vvenc_get_config(e: *mut std::ffi::c_void, c: *mut VvencConfig) -> i32;
+    fn vvenc_get_config_as_string(c: *const VvencConfig, lvl: i32) -> *const std::ffi::c_char;
+    fn vvenc_get_last_error(e: *mut std::ffi::c_void) -> *const std::ffi::c_char;
+    fn vvenc_get_version() -> *const std::ffi::c_char;
+}
+
+#[cfg(have_vvenc)]
+const STATIC_SYMS: &[(&str, VoidPtr)] = &[
+    ("vvenc_init_default", vvenc_init_default as *const () as VoidPtr),
+    ("vvenc_set_param", vvenc_set_param as *const () as VoidPtr),
+    ("vvenc_set_msg_callback", vvenc_set_msg_callback as *const () as VoidPtr),
+    ("vvenc_encoder_create", vvenc_encoder_create as *const () as VoidPtr),
+    ("vvenc_encoder_open", vvenc_encoder_open as *const () as VoidPtr),
+    ("vvenc_get_headers", vvenc_get_headers as *const () as VoidPtr),
+    ("vvenc_encode", vvenc_encode as *const () as VoidPtr),
+    ("vvenc_encoder_close", vvenc_encoder_close as *const () as VoidPtr),
+    ("vvenc_get_config", vvenc_get_config as *const () as VoidPtr),
+    ("vvenc_get_config_as_string", vvenc_get_config_as_string as *const () as VoidPtr),
+    ("vvenc_get_last_error", vvenc_get_last_error as *const () as VoidPtr),
+    ("vvenc_get_version", vvenc_get_version as *const () as VoidPtr),
+];
+
 struct Lib {
-    handle: VoidPtr,
+    handle: Option<VoidPtr>,
 }
 
 impl Lib {
     fn open() -> Result<Lib, String> {
-        #[cfg(unix)]
-        let names = ["libvvenc.so.1.14", "libvvenc.so.1", "libvvenc.so"];
-        #[cfg(windows)]
-        let names = ["vvenc.dll"];
-        let handle = dynlib::open(&names)?;
-        Ok(Lib { handle })
+        #[cfg(have_vvenc)]
+        {
+            let _ = STATIC_SYMS;
+            return Ok(Lib { handle: None });
+        }
+        #[cfg(not(have_vvenc))]
+        {
+            #[cfg(unix)]
+            let names = ["libvvenc.so.1.14", "libvvenc.so.1", "libvvenc.so"];
+            #[cfg(windows)]
+            let names = ["vvenc.dll"];
+            let handle = dynlib::open(&names)?;
+            Ok(Lib { handle: Some(handle) })
+        }
     }
 
     fn sym(&self, name: &str) -> Result<VoidPtr, String> {
-        dynlib::symbol(self.handle, name)
+        #[cfg(have_vvenc)]
+        {
+            STATIC_SYMS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, p)| *p)
+                .ok_or_else(|| format!("static symbol {name} missing"))
+        }
+        #[cfg(not(have_vvenc))]
+        {
+            dynlib::symbol(self.handle.expect("libvvenc handle"), name)
+        }
     }
 }
 
 impl Drop for Lib {
     fn drop(&mut self) {
-        dynlib::close(self.handle);
+        #[cfg(not(have_vvenc))]
+        if let Some(h) = self.handle {
+            dynlib::close(h);
+        }
     }
 }
 
@@ -214,15 +273,11 @@ impl Default for VvencConfig {
     }
 }
 
-// vsnprintf lives in the UCRT on MSVC; rustc does not link ucrt by
-// default, so request it explicitly there (unix/windows-gnu resolve it
-// from the default CRT import libraries).
-#[cfg(all(windows, target_env = "msvc"))]
-#[link(name = "ucrt")]
-extern "C" {
-    fn vsnprintf(s: *mut std::ffi::c_char, n: usize, fmt: *const std::ffi::c_char, ap: *mut std::ffi::c_void) -> std::ffi::c_int;
-}
-#[cfg(not(all(windows, target_env = "msvc")))]
+// Formatting a C va_list needs the CRT's vsnprintf, which is not reliably
+// resolvable on every Windows toolchain (MSVC's import libraries disagree
+// on the exported name); the callback therefore formats only on Unix and
+// prints a minimal diagnostic on Windows.
+#[cfg(unix)]
 extern "C" {
     fn vsnprintf(s: *mut std::ffi::c_char, n: usize, fmt: *const std::ffi::c_char, ap: *mut std::ffi::c_void) -> std::ffi::c_int;
 }
@@ -248,20 +303,25 @@ extern "C" fn vvenc_msg_cb(
     if level < 1 {
         return;
     }
-    let mut buf = [0i8; 2048];
-    let n = unsafe { vsnprintf(buf.as_mut_ptr() as *mut std::ffi::c_char, buf.len(), fmt, args) };
-    if n <= 0 {
-        return;
-    }
-    let msg = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::ffi::c_char) }
-        .to_string_lossy()
-        .into_owned();
     let tag = match level {
         1 => "error",
         2 => "warning",
         _ => "info",
     };
-    eprintln!("vvenc[{tag}]: {msg}");
+    #[cfg(unix)]
+    {
+        let mut buf = [0i8; 2048];
+        let n = unsafe { vsnprintf(buf.as_mut_ptr() as *mut std::ffi::c_char, buf.len(), fmt, args) };
+        if n > 0 {
+            let msg = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::ffi::c_char) }
+                .to_string_lossy()
+                .into_owned();
+            eprintln!("vvenc[{tag}]: {msg}");
+            return;
+        }
+    }
+    let _ = (fmt, args);
+    eprintln!("vvenc[{tag}]: (message)");
 }
 
 // ---------------------------------------------------------------------------
