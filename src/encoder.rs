@@ -467,6 +467,287 @@ fn set_block(plane: &mut PlaneS16, x: usize, y: usize, tu_size: usize, residual:
 // Encoder
 // ---------------------------------------------------------------------------
 
+struct PlaneResult {
+    plane_residual: Vec<Vec<Vec<Chunk>>>,
+    temporal_chunks: Vec<Vec<Chunk>>,
+    output_plane: crate::frame::Plane,
+    tb: PlaneS16,
+    base_only: Vec<crate::frame::Plane>,
+    base_only_sse: u64,
+    energy_l1: [f64; 16],
+    energy_l2: [f64; 16],
+    chunks_l1: u64,
+    chunks_l2: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_plane(
+    cfg: &LcevcConfig,
+    source: &Picture,
+    base_picture: &Picture,
+    l1_targets: &[Plane],
+    kernel: &[i16; 4],
+    apply_pa: bool,
+    temporal_refresh: bool,
+    temporal_signalling: bool,
+    tu_size: usize,
+    num_layers: usize,
+    tu_order: bool,
+    sw_l1: u32,
+    sw_l2: u32,
+    qm: &[Vec<u8>; 2],
+    mut tb: PlaneS16,
+    plane: usize,
+    rdoq: bool,
+) -> Result<PlaneResult, String> {
+    let mut chunks_l1: u64 = 0;
+    let mut chunks_l2: u64 = 0;
+    let mut base_only: Vec<crate::frame::Plane> = Vec::new();
+    let mut base_only_sse: u64 = 0;
+    let mut temporal_chunks: Vec<Vec<Chunk>> = Vec::new();
+            let base_plane = &base_picture.planes[plane];
+            let base_s16 = base_plane.to_s16(cfg.sample_depth());
+            let l1_pred = upscale_plane(&base_s16, cfg.scaling_l1, &kernel, apply_pa);
+            let l1_target_s16 = l1_targets[plane].to_s16(cfg.sample_depth());
+            let mut l1_recon = l1_pred.clone();
+
+            // ---- LOQ1 (L1) ----
+            let sw1 = dequant::loq_step_width(
+                sw_l1 as i32, plane, false, cfg.chroma_step_width_multiplier);
+            let table1 = DequantTable::compute(
+                sw1, &qm[1], cfg.temporal_enabled, false, temporal_refresh,
+                cfg.temporal_step_width_modifier, -1, false);
+            let forward1 = ForwardTransform::new(cfg.transform.to_bit(), cfg.scaling_l1 == ScalingMode::Scale1D);
+            let deblock = cfg.level1_filtering_signalled;
+
+            let n_l1_tiles = cfg.num_tiles(1, plane);
+            let mut l1_events: Vec<Vec<Vec<CoeffEvent>>> =
+                vec![vec![Vec::new(); num_layers]; n_l1_tiles];
+            let mut l1_runs: Vec<Vec<u32>> = vec![vec![0; num_layers]; n_l1_tiles];
+            let mut energy_l1 = [0.0f64; 16];
+            process_loq_tiles(
+                cfg, 1, plane, |tu_state, i, _| {
+                    tu_state.surface_or_block_position(i, tu_order)
+                },
+                &mut |x, y, tile| {
+                    let (coeffs, residual) = encode_tu(
+                        &l1_target_s16, &l1_pred, &table1, &forward1, tu_size, x, y,
+                        TemporalSignal::Inter, deblock,
+                        cfg.level1_filtering_first_coefficient,
+                        cfg.level1_filtering_second_coefficient,
+                        &mut energy_l1, rdoq,
+                    );
+                    commit_residual(&mut l1_recon, x, y, tu_size, &residual);
+                    for l in 0..num_layers {
+                        push_coeff(&mut l1_events[tile][l], &mut l1_runs[tile][l], coeffs[l]);
+                    }
+                    if plane == 0 && x == 0 && y == 0 {
+                    }
+                },
+            )?;
+
+            // ---- LOQ0 (L2) ----
+            let l2_pred = upscale_plane(&l1_recon, cfg.scaling_l2, &kernel, apply_pa);
+            let src_s16 = source.planes[plane].to_s16(cfg.sample_depth());
+            let mut l2_recon = l2_pred.clone();
+            {
+                // Base-only prediction: the pure base upscaled (no residual).
+                // SSE measured in the sample domain to match recon_sse.
+                let base_only_plane = upscale_plane(&l1_pred, cfg.scaling_l2, &kernel, apply_pa)
+                    .to_plane(cfg.sample_depth());
+                let mut sse = 0u64;
+                for (a, b) in source.planes[plane].data.iter().zip(base_only_plane.data.iter()) {
+                    let d = (*a as i64 - *b as i64).unsigned_abs();
+                    sse += d * d;
+                }
+                base_only_sse += sse;
+                base_only.push(base_only_plane);
+            }
+
+            let temporal_enabled = cfg.temporal_enabled;
+            let sw2 = dequant::loq_step_width(
+                sw_l2 as i32, plane, true, cfg.chroma_step_width_multiplier);
+            let table_inter = DequantTable::compute(
+                sw2, &qm[0], temporal_enabled, true, temporal_refresh,
+                cfg.temporal_step_width_modifier, -1, false);
+            let table_intra = DequantTable::compute(
+                sw2, &qm[0], false, true, false,
+                cfg.temporal_step_width_modifier, -1, false);
+            let forward0 = ForwardTransform::new(cfg.transform.to_bit(), cfg.scaling_l2 == ScalingMode::Scale1D);
+
+
+            let mut energy_l2 = [0.0f64; 16];
+            let n_l2_tiles = cfg.num_tiles(0, plane);
+            let mut l2_events: Vec<Vec<Vec<CoeffEvent>>> =
+                vec![vec![Vec::new(); num_layers]; n_l2_tiles];
+            let mut l2_runs: Vec<Vec<u32>> = vec![vec![0; num_layers]; n_l2_tiles];
+            let mut temporal_runs: Vec<Vec<TemporalRun>> = Vec::with_capacity(n_l2_tiles);
+            for _ in 0..n_l2_tiles {
+                temporal_runs.push(Vec::new());
+            }
+
+            process_loq_tiles(
+                cfg, 0, plane, |tu_state, i, _| {
+                    tu_state.surface_or_block_position(i, tu_order)
+                },
+                &mut |x, y, tile| {
+                    let (coeffs, signal) = if temporal_enabled && !temporal_refresh {
+                        // Inter trial: prediction includes the temporal buffer.
+                        // Build the residual locally (pred + tb per sample) —
+                        // cloning the whole plane per TU would be O(TUs x W x H).
+                        let mut residual = [0i16; 16];
+                        for yy in 0..tu_size {
+                            for xx in 0..tu_size {
+                                let idx = residual_index(tu_size, xx, yy);
+                                let v = l2_pred.get(x + xx, y + yy) as i32
+                                    + tb.get(x + xx, y + yy) as i32;
+                                residual[idx] = (src_s16.get(x + xx, y + yy) as i32 - v)
+                                    .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            }
+                        }
+                        let n = tu_size * tu_size;
+                        let (c_inter, r_inter) = encode_tu_residual(
+                            &residual[..n], &table_inter, &forward0,
+                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
+                        let mut sse_inter = 0i64;
+                        for yy in 0..tu_size {
+                            for xx in 0..tu_size {
+                                let v = (l2_pred.get(x + xx, y + yy) as i32
+                                    + tb.get(x + xx, y + yy) as i32)
+                                    .clamp(i16::MIN as i32, i16::MAX as i32) as i64;
+                                let d = src_s16.get(x + xx, y + yy) as i64
+                                    - (v + r_inter[residual_index(tu_size, xx, yy)] as i64);
+                                sse_inter += d * d;
+                            }
+                        }
+                        let (c_intra, r_intra) = encode_tu(
+                            &src_s16, &l2_pred, &table_intra, &forward0, tu_size, x, y,
+                            TemporalSignal::Intra, false, 0, 0, &mut energy_l2, rdoq);
+                        let sse_intra = block_sse(&l2_pred, x, y, tu_size, &r_intra, &src_s16);
+                        if sse_inter <= sse_intra as i64 {
+                            add_block(&mut tb, x, y, tu_size, &r_inter);
+                            set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
+                            (c_inter, TemporalSignal::Inter)
+                        } else {
+                            set_block(&mut tb, x, y, tu_size, &r_intra);
+                            set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
+                            (c_intra, TemporalSignal::Intra)
+                        }
+                    } else {
+                        // No temporal prediction (disabled or refresh frame):
+                        // the decoder always "sets" the temporal buffer.
+                        let (coeffs, residual) = encode_tu(
+                            &src_s16, &l2_pred, &table_inter, &forward0, tu_size, x, y,
+                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
+                        commit_residual(&mut l2_recon, x, y, tu_size, &residual);
+                        if temporal_enabled {
+                            set_block(&mut tb, x, y, tu_size, &residual);
+                        }
+                        (coeffs, TemporalSignal::Intra)
+                    };
+                    for l in 0..num_layers {
+                                        push_coeff(&mut l2_events[tile][l], &mut l2_runs[tile][l], coeffs[l]);
+                    }
+                    if temporal_enabled && !temporal_refresh {
+                        let runs = &mut temporal_runs[tile];
+                        if let Some(last) = runs.last_mut() {
+                            if last.signal == signal as u8 {
+                                last.count += 1;
+                                return;
+                            }
+                        }
+                        runs.push(TemporalRun { signal: signal as u8, count: 1 });
+                    }
+                },
+            )?;
+
+
+            for l in 0..num_layers {
+                energy_l1[l] = energy_l1[l];
+            }
+            // Flush trailing zero runs so every TU of every layer is covered
+            // (the decoder otherwise reads padding as coefficients).
+            for tile in 0..n_l1_tiles {
+                for l in 0..num_layers {
+                    flush_run(&mut l1_events[tile][l], l1_runs[tile][l]);
+                }
+            }
+            for tile in 0..n_l1_tiles {
+                for l in 0..num_layers {
+                    flush_run(&mut l1_events[tile][l], l1_runs[tile][l]);
+                }
+            }
+            for tile in 0..n_l2_tiles {
+                for l in 0..num_layers {
+                    flush_run(&mut l2_events[tile][l], l2_runs[tile][l]);
+                }
+            }
+            if plane == 0 {
+            }
+
+            // Assemble the per-plane chunk arrays.
+            let mut plane_residual = Vec::with_capacity(2);
+            for (loq_idx, tile_events) in [&l1_events, &l2_events].iter().enumerate() {
+                let tile_events: &Vec<Vec<Vec<CoeffEvent>>> = tile_events;
+                let mut loq_chunks = Vec::with_capacity(num_layers);
+                for layer in 0..num_layers {
+                    let mut tiles = Vec::with_capacity(tile_events.len());
+                    for tile_ev in tile_events {
+                        let events = &tile_ev[layer];
+                        if events.is_empty() {
+                            tiles.push(Chunk { entropy_enabled: false, rle_only: false, data: Vec::new() });
+                        } else {
+                            let cd = write_coefficient_chunk(events);
+                            if plane == 0 && loq_idx == 1 && layer == 1 {
+                            }
+                            tiles.push(Chunk {
+                                entropy_enabled: true,
+                                rle_only: false,
+                                data: cd,
+                            });
+                            if loq_idx == 0 {
+                                chunks_l1 += 1;
+                            } else {
+                                chunks_l2 += 1;
+                            }
+                        }
+                    }
+                    loq_chunks.push(tiles);
+                }
+                plane_residual.push(loq_chunks);
+            }
+            // Temporal chunk per tile (LOQ0 tile count).
+            if temporal_signalling {
+                let n_tiles = cfg.num_tiles(0, plane);
+                let mut tiles = Vec::with_capacity(n_tiles);
+                for tile in 0..n_tiles {
+                    let runs = &temporal_runs[tile];
+                    let data = crate::entropy::rle::write_temporal_chunk(runs);
+                    tiles.push(Chunk { entropy_enabled: true, rle_only: false, data });
+                }
+                temporal_chunks.push(tiles);
+            } else {
+                let n_tiles = cfg.num_tiles(0, plane);
+                temporal_chunks.push(
+                    (0..n_tiles).map(|_| Chunk { entropy_enabled: false, rle_only: false, data: Vec::new() }).collect(),
+                );
+            }
+
+            let output_plane = l2_recon.to_plane(cfg.sample_depth());
+            Ok(PlaneResult {
+                plane_residual,
+                temporal_chunks,
+                output_plane,
+                tb,
+                base_only,
+                base_only_sse,
+                energy_l1,
+                energy_l2,
+                chunks_l1,
+                chunks_l2,
+            })
+}
+
 impl Encoder {
     pub fn new(config: LcevcConfig, step_width_l1: u32, step_width_l2: u32) -> Encoder {
         let qm_scaling_1d = config.scaling_l2 == ScalingMode::Scale1D;
@@ -663,239 +944,46 @@ impl Encoder {
         // it untouched, so the encoder must too.
         let tb_start = if cfg.temporal_enabled { self.temporal_buffers.clone() } else { Vec::new() };
 
-        for plane in 0..nplanes {
-            let base_plane = &base_picture.planes[plane];
-            let base_s16 = base_plane.to_s16(cfg.sample_depth());
-            let l1_pred = upscale_plane(&base_s16, cfg.scaling_l1, &kernel, apply_pa);
-            let l1_target_s16 = l1_targets[plane].to_s16(cfg.sample_depth());
-            let mut l1_recon = l1_pred.clone();
-
-            // ---- LOQ1 (L1) ----
-            let sw1 = dequant::loq_step_width(
-                sw_l1 as i32, plane, false, cfg.chroma_step_width_multiplier);
-            let table1 = DequantTable::compute(
-                sw1, &self.quant_matrix[1], cfg.temporal_enabled, false, temporal_refresh,
-                cfg.temporal_step_width_modifier, -1, false);
-            let forward1 = ForwardTransform::new(cfg.transform.to_bit(), cfg.scaling_l1 == ScalingMode::Scale1D);
-            let deblock = cfg.level1_filtering_signalled;
-
-            let n_l1_tiles = cfg.num_tiles(1, plane);
-            let mut l1_events: Vec<Vec<Vec<CoeffEvent>>> =
-                vec![vec![Vec::new(); num_layers]; n_l1_tiles];
-            let mut l1_runs: Vec<Vec<u32>> = vec![vec![0; num_layers]; n_l1_tiles];
-            let mut energy_l1 = [0.0f64; 16];
-            process_loq_tiles(
-                cfg, 1, plane, |tu_state, i, _| {
-                    tu_state.surface_or_block_position(i, tu_order)
-                },
-                &mut |x, y, tile| {
-                    let (coeffs, residual) = encode_tu(
-                        &l1_target_s16, &l1_pred, &table1, &forward1, tu_size, x, y,
-                        TemporalSignal::Inter, deblock,
-                        cfg.level1_filtering_first_coefficient,
-                        cfg.level1_filtering_second_coefficient,
-                        &mut energy_l1, rdoq,
-                    );
-                    commit_residual(&mut l1_recon, x, y, tu_size, &residual);
-                    for l in 0..num_layers {
-                        push_coeff(&mut l1_events[tile][l], &mut l1_runs[tile][l], coeffs[l]);
-                    }
-                    if plane == 0 && x == 0 && y == 0 {
-                    }
-                },
-            )?;
-
-            // ---- LOQ0 (L2) ----
-            let l2_pred = upscale_plane(&l1_recon, cfg.scaling_l2, &kernel, apply_pa);
-            let src_s16 = source.planes[plane].to_s16(cfg.sample_depth());
-            let mut l2_recon = l2_pred.clone();
-            {
-                // Base-only prediction: the pure base upscaled (no residual).
-                // SSE measured in the sample domain to match recon_sse.
-                let base_only_plane = upscale_plane(&l1_pred, cfg.scaling_l2, &kernel, apply_pa)
-                    .to_plane(cfg.sample_depth());
-                let mut sse = 0u64;
-                for (a, b) in source.planes[plane].data.iter().zip(base_only_plane.data.iter()) {
-                    let d = (*a as i64 - *b as i64).unsigned_abs();
-                    sse += d * d;
-                }
-                base_only_sse += sse;
-                base_only_planes.push(base_only_plane);
-            }
-
-            let temporal_enabled = cfg.temporal_enabled;
-            let sw2 = dequant::loq_step_width(
-                sw_l2 as i32, plane, true, cfg.chroma_step_width_multiplier);
-            let table_inter = DequantTable::compute(
-                sw2, &self.quant_matrix[0], temporal_enabled, true, temporal_refresh,
-                cfg.temporal_step_width_modifier, -1, false);
-            let table_intra = DequantTable::compute(
-                sw2, &self.quant_matrix[0], false, true, false,
-                cfg.temporal_step_width_modifier, -1, false);
-            let forward0 = ForwardTransform::new(cfg.transform.to_bit(), cfg.scaling_l2 == ScalingMode::Scale1D);
-
-            let mut tb = std::mem::replace(&mut self.temporal_buffers[plane], PlaneS16::new(1, 1));
-            let mut energy_l2 = [0.0f64; 16];
-            let n_l2_tiles = cfg.num_tiles(0, plane);
-            let mut l2_events: Vec<Vec<Vec<CoeffEvent>>> =
-                vec![vec![Vec::new(); num_layers]; n_l2_tiles];
-            let mut l2_runs: Vec<Vec<u32>> = vec![vec![0; num_layers]; n_l2_tiles];
-            let mut temporal_runs: Vec<Vec<TemporalRun>> = Vec::with_capacity(n_l2_tiles);
-            for _ in 0..n_l2_tiles {
-                temporal_runs.push(Vec::new());
-            }
-
-            process_loq_tiles(
-                cfg, 0, plane, |tu_state, i, _| {
-                    tu_state.surface_or_block_position(i, tu_order)
-                },
-                &mut |x, y, tile| {
-                    let (coeffs, signal) = if temporal_enabled && !temporal_refresh {
-                        // Inter trial: prediction includes the temporal buffer.
-                        // Build the residual locally (pred + tb per sample) —
-                        // cloning the whole plane per TU would be O(TUs x W x H).
-                        let mut residual = [0i16; 16];
-                        for yy in 0..tu_size {
-                            for xx in 0..tu_size {
-                                let idx = residual_index(tu_size, xx, yy);
-                                let v = l2_pred.get(x + xx, y + yy) as i32
-                                    + tb.get(x + xx, y + yy) as i32;
-                                residual[idx] = (src_s16.get(x + xx, y + yy) as i32 - v)
-                                    .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                            }
-                        }
-                        let n = tu_size * tu_size;
-                        let (c_inter, r_inter) = encode_tu_residual(
-                            &residual[..n], &table_inter, &forward0,
-                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
-                        let mut sse_inter = 0i64;
-                        for yy in 0..tu_size {
-                            for xx in 0..tu_size {
-                                let v = (l2_pred.get(x + xx, y + yy) as i32
-                                    + tb.get(x + xx, y + yy) as i32)
-                                    .clamp(i16::MIN as i32, i16::MAX as i32) as i64;
-                                let d = src_s16.get(x + xx, y + yy) as i64
-                                    - (v + r_inter[residual_index(tu_size, xx, yy)] as i64);
-                                sse_inter += d * d;
-                            }
-                        }
-                        let (c_intra, r_intra) = encode_tu(
-                            &src_s16, &l2_pred, &table_intra, &forward0, tu_size, x, y,
-                            TemporalSignal::Intra, false, 0, 0, &mut energy_l2, rdoq);
-                        let sse_intra = block_sse(&l2_pred, x, y, tu_size, &r_intra, &src_s16);
-                        if sse_inter <= sse_intra as i64 {
-                            add_block(&mut tb, x, y, tu_size, &r_inter);
-                            set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
-                            (c_inter, TemporalSignal::Inter)
-                        } else {
-                            set_block(&mut tb, x, y, tu_size, &r_intra);
-                            set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
-                            (c_intra, TemporalSignal::Intra)
-                        }
-                    } else {
-                        // No temporal prediction (disabled or refresh frame):
-                        // the decoder always "sets" the temporal buffer.
-                        let (coeffs, residual) = encode_tu(
-                            &src_s16, &l2_pred, &table_inter, &forward0, tu_size, x, y,
-                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
-                        commit_residual(&mut l2_recon, x, y, tu_size, &residual);
-                        if temporal_enabled {
-                            set_block(&mut tb, x, y, tu_size, &residual);
-                        }
-                        (coeffs, TemporalSignal::Intra)
-                    };
-                    for l in 0..num_layers {
-                                        push_coeff(&mut l2_events[tile][l], &mut l2_runs[tile][l], coeffs[l]);
-                    }
-                    if temporal_enabled && !temporal_refresh {
-                        let runs = &mut temporal_runs[tile];
-                        if let Some(last) = runs.last_mut() {
-                            if last.signal == signal as u8 {
-                                last.count += 1;
-                                return;
-                            }
-                        }
-                        runs.push(TemporalRun { signal: signal as u8, count: 1 });
-                    }
-                },
-            )?;
-
-            self.temporal_buffers[plane] = tb;
+        let quant_matrix = self.quant_matrix.clone();
+        let tbs = std::mem::take(&mut self.temporal_buffers);
+        let plane_results: Vec<PlaneResult> = std::thread::scope(|s| -> Result<Vec<PlaneResult>, String> {
+            let handles: Vec<_> = tbs
+                .into_iter()
+                .enumerate()
+                .map(|(plane, tb)| {
+                    let cfg = &cfg;
+                    let source = source;
+                    let base_picture = base_picture;
+                    let l1_targets = &l1_targets;
+                    let kernel = &kernel;
+                    let qm = &quant_matrix;
+                    s.spawn(move || {
+                        process_plane(
+                            cfg, source, base_picture, l1_targets, kernel, apply_pa,
+                            temporal_refresh, temporal_signalling, tu_size, num_layers,
+                            tu_order, sw_l1, sw_l2, qm, tb, plane, rdoq,
+                        )
+                    })
+                })
+                .collect();
+            Ok(handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Result<Vec<_>, _>>()?)
+        })?;
+        for (plane, r) in plane_results.into_iter().enumerate() {
+            residual_chunks.push(r.plane_residual);
+            temporal_chunks.extend(r.temporal_chunks);
+            output.planes[plane] = r.output_plane;
+            self.temporal_buffers.push(r.tb);
+            base_only_sse += r.base_only_sse;
+            base_only_planes.extend(r.base_only);
             for l in 0..num_layers {
-                frame_energy[1][l] += energy_l1[l];
-                frame_energy[0][l] += energy_l2[l];
+                frame_energy[1][l] += r.energy_l1[l];
+                frame_energy[0][l] += r.energy_l2[l];
             }
-            // Flush trailing zero runs so every TU of every layer is covered
-            // (the decoder otherwise reads padding as coefficients).
-            for tile in 0..n_l1_tiles {
-                for l in 0..num_layers {
-                    flush_run(&mut l1_events[tile][l], l1_runs[tile][l]);
-                }
-            }
-            for tile in 0..n_l1_tiles {
-                for l in 0..num_layers {
-                    flush_run(&mut l1_events[tile][l], l1_runs[tile][l]);
-                }
-            }
-            for tile in 0..n_l2_tiles {
-                for l in 0..num_layers {
-                    flush_run(&mut l2_events[tile][l], l2_runs[tile][l]);
-                }
-            }
-            if plane == 0 {
-            }
-
-            // Assemble the per-plane chunk arrays.
-            let mut plane_residual = Vec::with_capacity(2);
-            for (loq_idx, tile_events) in [&l1_events, &l2_events].iter().enumerate() {
-                let tile_events: &Vec<Vec<Vec<CoeffEvent>>> = tile_events;
-                let mut loq_chunks = Vec::with_capacity(num_layers);
-                for layer in 0..num_layers {
-                    let mut tiles = Vec::with_capacity(tile_events.len());
-                    for tile_ev in tile_events {
-                        let events = &tile_ev[layer];
-                        if events.is_empty() {
-                            tiles.push(Chunk { entropy_enabled: false, rle_only: false, data: Vec::new() });
-                        } else {
-                            let cd = write_coefficient_chunk(events);
-                            if plane == 0 && loq_idx == 1 && layer == 1 {
-                            }
-                            tiles.push(Chunk {
-                                entropy_enabled: true,
-                                rle_only: false,
-                                data: cd,
-                            });
-                            if loq_idx == 0 {
-                                self.stats.l1_chunks += 1;
-                            } else {
-                                self.stats.l2_chunks += 1;
-                            }
-                        }
-                    }
-                    loq_chunks.push(tiles);
-                }
-                plane_residual.push(loq_chunks);
-            }
-            residual_chunks.push(plane_residual);
-
-            // Temporal chunk per tile (LOQ0 tile count).
-            if temporal_signalling {
-                let n_tiles = cfg.num_tiles(0, plane);
-                let mut tiles = Vec::with_capacity(n_tiles);
-                for tile in 0..n_tiles {
-                    let runs = &temporal_runs[tile];
-                    let data = crate::entropy::rle::write_temporal_chunk(runs);
-                    tiles.push(Chunk { entropy_enabled: true, rle_only: false, data });
-                }
-                temporal_chunks.push(tiles);
-            } else {
-                let n_tiles = cfg.num_tiles(0, plane);
-                temporal_chunks.push(
-                    (0..n_tiles).map(|_| Chunk { entropy_enabled: false, rle_only: false, data: Vec::new() }).collect(),
-                );
-            }
-
-            output.planes[plane] = l2_recon.to_plane(cfg.sample_depth());
+            self.stats.l1_chunks += r.chunks_l1;
+            self.stats.l2_chunks += r.chunks_l2;
         }
 
         // Adaptive enhancement: if the residual does not improve the

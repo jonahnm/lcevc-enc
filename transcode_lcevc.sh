@@ -26,7 +26,7 @@
 #                         prediction, --scaling-l1 2 for a quarter-res base)
 #
 # The total frame count is probed (ffprobe) so the progress line shows
-# N/M with ETA. Temporal prediction and RDOQ are off by default (each costs
+# N/M with ETA. Temporal prediction is off by default (costs ~50%
 # ~20-50% encode time for ~+0.1 dB); enable them by passing
 # --temporal on --temporal-sw-modifier 24 or removing --no-rdoq.
 #
@@ -162,7 +162,7 @@ set -o pipefail
         --upsampler modified-cubic \
         --qm-beta 0.3 \
         --step-width-l1 1024 --step-width-l2 256 \
-        --no-psnr --no-rdoq \
+        --no-psnr \
         "${FRAMES_ARG[@]}" \
         "${GOP_ARGS[@]}" \
         "${TARGET_ARGS[@]}" \
