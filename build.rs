@@ -385,7 +385,14 @@ impl Compiler {
 
     fn command(&self, src: &Path, obj: &Path, inc: &[PathBuf], arch: Arch) -> Command {
         let mut cmd = Command::new(&self.cxx);
-        let (defs, flags) = self.simd_for(src, arch);
+        let (mut defs, flags) = self.simd_for(src, arch);
+        // The vvenc build defines the target SIMD family globally (the
+        // headers branch on it, e.g. the MSVC bit_scan_reverse helper).
+        defs.push(match arch {
+            Arch::X86 => "TARGET_SIMD_X86=1".to_string(),
+            Arch::Arm => "TARGET_SIMD_ARM=1".to_string(),
+            Arch::None => "".to_string(),
+        });
         match self.kind {
             CompilerKind::Msvc => {
                 cmd.arg("/nologo").arg("/c").arg("/O2").arg("/MD");
@@ -396,7 +403,9 @@ impl Compiler {
                     cmd.arg(format!("/I{}", i.display()));
                 }
                 for d in &defs {
-                    cmd.arg(format!("/D{d}"));
+                    if !d.is_empty() {
+                        cmd.arg(format!("/D{d}"));
+                    }
                 }
                 for f in &flags {
                     cmd.arg(f);
@@ -410,7 +419,9 @@ impl Compiler {
                     cmd.arg(format!("-I{}", i.display()));
                 }
                 for d in &defs {
-                    cmd.arg(format!("-D{d}"));
+                    if !d.is_empty() {
+                        cmd.arg(format!("-D{d}"));
+                    }
                 }
                 for f in &flags {
                     cmd.arg(f);
