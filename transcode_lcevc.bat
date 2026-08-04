@@ -93,10 +93,21 @@ set "PIXFMT=yuv420p"
 set "FORMAT=yuv420p"
 set "PF="
 for /f "delims=" %%i in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "%INPUT%" 2^>nul') do set "PF=%%i"
-echo %PF% | findstr /r "10 12 16" >nul && (
+set "BITS="
+for /f "delims=" %%i in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of csv=p=0 "%INPUT%" 2^>nul') do set "BITS=%%i"
+echo !BITS! | findstr /r "10 12 14 16" >nul && (
     set "DEPTH=10"
     set "PIXFMT=yuv420p10le"
     set "FORMAT=yuv420p10le"
+)
+if "!DEPTH!"=="8" (
+    rem Fallback when bits_per_raw_sample is unavailable: match the pixel
+    rem format name (avoid 8-bit NV12/NV16 whose names contain "12"/"16").
+    echo %PF% | findstr /r "p10 p12 p14 p16 010 012 014 016" >nul && (
+        set "DEPTH=10"
+        set "PIXFMT=yuv420p10le"
+        set "FORMAT=yuv420p10le"
+    )
 )
 
 set "VFILTER=scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=!FORMAT!"
