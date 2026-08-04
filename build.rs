@@ -170,8 +170,11 @@ fn main() {
         return;
     }
 
-    // Archive into libvvenc_static.
-    let lib = out.join(format!("libvvenc_static{}", cc.archive_suffix()));
+    // Archive into libvvenc_static (MSVC: no lib prefix; GNU: lib prefix).
+    let lib = out.join(match cc.kind {
+        CompilerKind::Msvc => "vvenc_static.lib",
+        CompilerKind::Gnu => "libvvenc_static.a",
+    });
     if !cc.archive(&lib, &objs) {
         let msg = "archiving vvenc failed".to_string();
         eprintln!("build.rs: {msg}; using runtime libvvenc instead");

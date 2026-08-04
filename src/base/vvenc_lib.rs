@@ -20,6 +20,7 @@ const VVENC_FASTER: i32 = 0;
 type VoidPtr = *mut std::ffi::c_void;
 
 #[cfg(unix)]
+#[allow(dead_code)]
 mod dynlib {
     use std::ffi::{c_char, c_int, c_void};
     extern "C" {
@@ -62,6 +63,7 @@ mod dynlib {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 mod dynlib {
     use std::ffi::c_void;
     extern "system" {
@@ -142,6 +144,7 @@ const STATIC_SYMS: &[(&str, VoidPtr)] = &[
 ];
 
 struct Lib {
+    #[allow(dead_code)]
     handle: Option<VoidPtr>,
 }
 
