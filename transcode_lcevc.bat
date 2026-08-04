@@ -130,34 +130,31 @@ if defined SCALE set "VFILTER=scale=!SCALE!:flags=lanczos,format=!FORMAT!"
 echo == detected: pix_fmt=%PF%, bits_per_raw_sample=%BITS% -^> !DEPTH!-bit pipeline
 
 rem --- detect the total frame count (for the N/M progress + ETA) ---
+rem All probes go through temp files: cmd's for /f command substitution
+rem breaks on filenames with parentheses/brackets.
 set "TOTAL_FRAMES="
 set "EXT=%~x1"
 if /i "%EXT%"==".mp4" (
     "%FFPROBE%" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_frames.txt" 2>nul
     if exist "%TEMP%\lcevc_frames.txt" set /p TOTAL_FRAMES=<"%TEMP%\lcevc_frames.txt"
 )
-if not defined TOTAL_FRAMES (
-    rem estimate: duration x fps. Probes go through temp files (like the
-    rem depth detection) because for /f commands break on filenames with
-    rem parentheses/brackets.
-    set "DUR="
-    "%FFPROBE%" -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_dur.txt" 2>nul
-    if exist "%TEMP%\lcevc_dur.txt" set /p DUR=<"%TEMP%\lcevc_dur.txt"
-    if defined DUR for /f "delims=." %%a in ("!DUR!") do set "DUR=%%a"
-    set "FPS="
-    "%FFPROBE%" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_fps.txt" 2>nul
-    if exist "%TEMP%\lcevc_fps.txt" set /p FPS=<"%TEMP%\lcevc_fps.txt"
-    set "FNUM="
-    set "FDEN=1"
-    if defined FPS for /f "tokens=1,2 delims=/" %%n in ("!FPS!") do (
-        set "FNUM=%%n"
-        set "FDEN=%%m"
-    )
-    if defined DUR if defined FNUM set /a TOTAL_FRAMES=!DUR!*!FNUM!/!FDEN! 2>nul
-)
-del /q "%TEMP%\lcevc_dur.txt" "%TEMP%\lcevc_fps.txt" 2>nul
+"%FFPROBE%" -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_dur.txt" 2>nul
+set "DUR="
+if exist "%TEMP%\lcevc_dur.txt" set /p DUR=<"%TEMP%\lcevc_dur.txt"
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_fps.txt" 2>nul
+set "FPS="
+if exist "%TEMP%\lcevc_fps.txt" set /p FPS=<"%TEMP%\lcevc_fps.txt"
+set "FNUM="
+set "FDEN=1"
+if defined FPS for /f "tokens=1,2 delims=/" %%n in ("!FPS!") do set "FNUM=%%n" & set "FDEN=%%m"
+if defined DUR for /f "delims=." %%a in ("!DUR!") do set "DUR=%%a"
+if not defined TOTAL_FRAMES set /a TOTAL_FRAMES=!DUR!*!FNUM!/!FDEN! 2>nul
+if not defined TOTAL_FRAMES set "TOTAL_FRAMES=0"
 set "FRAMES_ARG="
-if defined TOTAL_FRAMES if !TOTAL_FRAMES! GTR 0 set "FRAMES_ARG=--frames !TOTAL_FRAMES!"
+if !TOTAL_FRAMES! GTR 0 set "FRAMES_ARG=--frames !TOTAL_FRAMES!"
+del /q "%TEMP%\lcevc_frames.txt" "%TEMP%\lcevc_dur.txt" "%TEMP%\lcevc_fps.txt" 2>nul
+
+echo == frames: dur=!DUR! fps=!FPS! fnum=!FNUM! fden=!FDEN! total=!TOTAL_FRAMES!
 
 echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid, !TOTAL_FRAMES! frames^)
 
