@@ -455,6 +455,33 @@ fn block_sse(pred: &PlaneS16, x: usize, y: usize, tu_size: usize, residual: &[i1
     sse
 }
 
+/// Raw prediction energies (without transform/quantisation) for one TU:
+/// returns (intra energy against the base-upscaled prediction, inter energy
+/// against prediction + temporal buffer). Used to pick a single trial when
+/// one candidate is clearly better.
+fn temporal_energies(
+    src: &PlaneS16,
+    pred: &PlaneS16,
+    tb: &PlaneS16,
+    x: usize,
+    y: usize,
+    tu_size: usize,
+) -> (i64, i64) {
+    let mut e_intra = 0i64;
+    let mut e_inter = 0i64;
+    for yy in 0..tu_size {
+        for xx in 0..tu_size {
+            let s = src.get(x + xx, y + yy) as i64;
+            let p = pred.get(x + xx, y + yy) as i64;
+            let d_intra = s - p;
+            e_intra += d_intra * d_intra;
+            let d_inter = d_intra - tb.get(x + xx, y + yy) as i64;
+            e_inter += d_inter * d_inter;
+        }
+    }
+    (e_intra, e_inter)
+}
+
 /// Add a residual block to a plane (temporal buffer inter update).
 fn add_block(plane: &mut PlaneS16, x: usize, y: usize, tu_size: usize, residual: &[i16]) {
     for yy in 0..tu_size {
@@ -660,46 +687,85 @@ fn process_plane(
                 },
                 &mut |x, y, tile| {
                     let (coeffs, signal) = if temporal_enabled && !temporal_refresh {
-                        // Inter trial: prediction includes the temporal buffer.
-                        // Build the residual locally (pred + tb per sample) —
-                        // cloning the whole plane per TU would be O(TUs x W x H).
-                        let mut residual = [0i16; 16];
-                        for yy in 0..tu_size {
-                            for xx in 0..tu_size {
-                                let idx = residual_index(tu_size, xx, yy);
-                                let v = l2_pred.get(x + xx, y + yy) as i32
-                                    + tb.get(x + xx, y + yy) as i32;
-                                residual[idx] = (src_s16.get(x + xx, y + yy) as i32 - v)
-                                    .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        // The full scheme runs two complete transform+quantise
+                        // trials per TU (inter vs intra) which doubles the
+                        // transform cost. Most TUs have a clear winner, so
+                        // compare the raw prediction energies in a single
+                        // pass and only run the second trial when the
+                        // candidates are close, keeping one transform per TU
+                        // on the clear winners.
+                        let (e_intra, e_inter) = temporal_energies(
+                            &src_s16, &l2_pred, &tb, x, y, tu_size);
+                        let ambiguous = 10 * e_inter.min(e_intra) >= 9 * e_inter.max(e_intra)
+                            && e_inter > 0 && e_intra > 0;
+                        if !ambiguous && e_inter < e_intra {
+                            // Inter clearly better: temporal prediction only.
+                            let mut residual = [0i16; 16];
+                            for yy in 0..tu_size {
+                                for xx in 0..tu_size {
+                                    let idx = residual_index(tu_size, xx, yy);
+                                    let v = l2_pred.get(x + xx, y + yy) as i32
+                                        + tb.get(x + xx, y + yy) as i32;
+                                    residual[idx] = (src_s16.get(x + xx, y + yy) as i32 - v)
+                                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                                }
                             }
-                        }
-                        let n = tu_size * tu_size;
-                        let (c_inter, r_inter) = encode_tu_residual(
-                            &residual[..n], &table_inter, &forward0,
-                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
-                        let mut sse_inter = 0i64;
-                        for yy in 0..tu_size {
-                            for xx in 0..tu_size {
-                                let v = (l2_pred.get(x + xx, y + yy) as i32
-                                    + tb.get(x + xx, y + yy) as i32)
-                                    .clamp(i16::MIN as i32, i16::MAX as i32) as i64;
-                                let d = src_s16.get(x + xx, y + yy) as i64
-                                    - (v + r_inter[residual_index(tu_size, xx, yy)] as i64);
-                                sse_inter += d * d;
-                            }
-                        }
-                        let (c_intra, r_intra) = encode_tu(
-                            &src_s16, &l2_pred, &table_intra, &forward0, tu_size, x, y,
-                            TemporalSignal::Intra, false, 0, 0, &mut energy_l2, rdoq);
-                        let sse_intra = block_sse(&l2_pred, x, y, tu_size, &r_intra, &src_s16);
-                        if sse_inter <= sse_intra as i64 {
+                            let n = tu_size * tu_size;
+                            let (c_inter, r_inter) = encode_tu_residual(
+                                &residual[..n], &table_inter, &forward0,
+                                TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
                             add_block(&mut tb, x, y, tu_size, &r_inter);
                             set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
                             (c_inter, TemporalSignal::Inter)
-                        } else {
+                        } else if !ambiguous {
+                            // Intra clearly better: refresh the buffer only.
+                            let (c_intra, r_intra) = encode_tu(
+                                &src_s16, &l2_pred, &table_intra, &forward0, tu_size, x, y,
+                                TemporalSignal::Intra, false, 0, 0, &mut energy_l2, rdoq);
                             set_block(&mut tb, x, y, tu_size, &r_intra);
                             set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
                             (c_intra, TemporalSignal::Intra)
+                        } else {
+                            // Ambiguous: run both trials, keep the lower
+                            // distortion (exact previous behaviour).
+                            let mut residual = [0i16; 16];
+                            for yy in 0..tu_size {
+                                for xx in 0..tu_size {
+                                    let idx = residual_index(tu_size, xx, yy);
+                                    let v = l2_pred.get(x + xx, y + yy) as i32
+                                        + tb.get(x + xx, y + yy) as i32;
+                                    residual[idx] = (src_s16.get(x + xx, y + yy) as i32 - v)
+                                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                                }
+                            }
+                            let n = tu_size * tu_size;
+                            let (c_inter, r_inter) = encode_tu_residual(
+                                &residual[..n], &table_inter, &forward0,
+                                TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
+                            let mut sse_inter = 0i64;
+                            for yy in 0..tu_size {
+                                for xx in 0..tu_size {
+                                    let v = (l2_pred.get(x + xx, y + yy) as i32
+                                        + tb.get(x + xx, y + yy) as i32)
+                                        .clamp(i16::MIN as i32, i16::MAX as i32) as i64;
+                                    let d = src_s16.get(x + xx, y + yy) as i64
+                                        - (v + r_inter[residual_index(tu_size, xx, yy)] as i64);
+                                    sse_inter += d * d;
+                                }
+                            }
+                            let (c_intra, r_intra) = encode_tu(
+                                &src_s16, &l2_pred, &table_intra, &forward0, tu_size, x, y,
+                                TemporalSignal::Intra, false, 0, 0, &mut energy_l2, rdoq);
+                            let sse_intra = block_sse(&l2_pred, x, y, tu_size, &r_intra, &src_s16);
+                            if sse_inter <= sse_intra as i64 {
+                                add_block(&mut tb, x, y, tu_size, &r_inter);
+                                set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
+                                (c_inter, TemporalSignal::Inter)
+                            } else {
+                                set_block(&mut tb, x, y, tu_size, &r_intra);
+                                set_recon_from_tb(&mut l2_recon, &l2_pred, &tb, x, y, tu_size);
+                                (c_intra, TemporalSignal::Intra)
+                            }
                         }
                     } else {
                         // No temporal prediction (disabled or refresh frame):
