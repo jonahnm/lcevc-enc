@@ -14,9 +14,11 @@ rem   OUTPUT_BASE.lcevc      raw LCEVC enhancement stream
 rem   OUTPUT_BASE.base.266   raw VVC base bitstream
 rem
 rem Options:
-rem   --target-kbps N    rate-control the enhancement toward N kbps
-rem   --audio            remux the source audio into the output MP4
-rem                      (stream copy, no re-encode)
+rem   --target-kbps N       rate-control the enhancement toward N kbps
+rem   --keyframe-interval N keyframe (GOP) interval in seconds
+rem   --scale WxH           downscale the video before encoding
+rem   --audio               remux the source audio into the output MP4
+rem                         (stream copy, no re-encode)
 rem   anything else      passed through to lcevc_enc (e.g. --frames N,
 rem                      --temporal on --temporal-sw-modifier 24 for temporal prediction)
 rem
@@ -47,6 +49,8 @@ if not defined OUT set "OUT=%~n1"
 
 set "TARGET="
 set "AUDIO=0"
+set "KEYFRAME="
+set "SCALE="
 set "EXTRA="
 :argloop
 if "%~1"=="" goto doneargs
@@ -58,6 +62,18 @@ if "%~1"=="--target-kbps" (
 )
 if "%~1"=="--audio" (
     set "AUDIO=1"
+    shift
+    goto argloop
+)
+if "%~1"=="--keyframe-interval" (
+    set "KEYFRAME=%~2"
+    shift
+    shift
+    goto argloop
+)
+if "%~1"=="--scale" (
+    set "SCALE=%~2"
+    shift
     shift
     goto argloop
 )
@@ -83,12 +99,17 @@ echo %PF% | findstr /r "10 12 16" >nul && (
     set "FORMAT=yuv420p10le"
 )
 
+set "VFILTER=scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=!FORMAT!"
+if defined SCALE set "VFILTER=scale=!SCALE!:flags=lanczos,format=!FORMAT!"
+
 echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid^)
 
 set "TARGET_ARGS="
 if defined TARGET set "TARGET_ARGS=--target-kbps !TARGET!"
+set "GOP_ARGS="
+if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAME!"
 
-"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=!FORMAT!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 256 --no-psnr !TARGET_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
+"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 256 --no-psnr !GOP_ARGS! !TARGET_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
 if errorlevel 1 (
     echo !! encode failed 1>&2
     exit /b 1

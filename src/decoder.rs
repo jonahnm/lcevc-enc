@@ -537,7 +537,7 @@ fn apply_chunks(
         // The temporal buffer must be applied to the output even when the
         // residual coefficients are all zero (the decoder's applyAddTemporal).
         if nonzero || (loq == 0 && cfg.temporal_enabled) {
-            let residual = if nonzero { forward.inverse(&dq) } else { vec![0i16; num_layers] };
+            let residual = if nonzero { forward.inverse(&dq) } else { [0i16; 16] };
             if update_tb {
                 // Update the temporal buffer and the reconstruction:
                 // inter: tb += residual; output = pred + tb

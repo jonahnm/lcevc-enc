@@ -267,10 +267,10 @@ fn encode_tu(
     deblock_side: u8,
     energy: &mut [f64],
     rdoq: bool,
-) -> (Vec<i16>, Vec<i16>) {
+) -> ([i16; 16], [i16; 16]) {
     // Build the residual block in the interleaved layout.
     let n = tu_size * tu_size;
-    let mut residual = vec![0i16; n];
+    let mut residual = [0i16; 16];
     for yy in 0..tu_size {
         for xx in 0..tu_size {
             let idx = residual_index(tu_size, xx, yy);
@@ -278,7 +278,7 @@ fn encode_tu(
                 .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
     }
-    encode_tu_residual(&residual, table, forward, signal, deblock, deblock_corner, deblock_side, energy, rdoq)
+    encode_tu_residual(&residual[..n], table, forward, signal, deblock, deblock_corner, deblock_side, energy, rdoq)
 }
 
 /// Quantize and reconstruct an already-built residual block.
@@ -293,12 +293,12 @@ fn encode_tu_residual(
     deblock_side: u8,
     energy: &mut [f64],
     rdoq: bool,
-) -> (Vec<i16>, Vec<i16>) {
+) -> ([i16; 16], [i16; 16]) {
     let tu_size = (residual.len() as f64).sqrt() as usize;
     let _ = (deblock, deblock_corner, deblock_side, tu_size);
 
     let (nums, denom) = forward.apply(residual);
-    let num_layers = nums.len();
+    let num_layers = forward.layers();
     for l in 0..num_layers {
         if let Some(e) = energy.get_mut(l) {
             let c = nums[l] as f64 / denom as f64;
@@ -307,7 +307,7 @@ fn encode_tu_residual(
     }
 
     // Quantize.
-    let mut coeffs = vec![0i16; num_layers];
+    let mut coeffs = [0i16; 16];
     for l in 0..num_layers {
         let layer = &table.layers[signal as usize][l];
         coeffs[l] = quantize(nums[l], denom, layer.step_width as i32, -(layer.offset as i32));
@@ -378,7 +378,7 @@ fn encode_tu_residual(
     }
 
     // Reconstruct: dequant (mirror) then inverse transform.
-    let mut dq = vec![0i16; num_layers];
+    let mut dq = [0i16; 16];
     for l in 0..num_layers {
         let layer = &table.layers[signal as usize][l];
         let c = coeffs[l] as i32;
@@ -391,7 +391,7 @@ fn encode_tu_residual(
         };
         dq[l] = v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
     }
-    let mut rec_residual = forward.inverse(&dq);
+    let mut rec_residual = forward.inverse(&dq[..num_layers]);
 
     // Optional L1 filter (deblock).
     if deblock && tu_size == 4 {
@@ -410,7 +410,7 @@ fn encode_tu_residual(
             filtered[idx] = ((rec_residual[idx] as i32 * k) >> 4)
                 .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
-        rec_residual = filtered.to_vec();
+        rec_residual = filtered;
     }
 
     (coeffs, rec_residual)
@@ -712,7 +712,7 @@ impl Encoder {
                         // Inter trial: prediction includes the temporal buffer.
                         // Build the residual locally (pred + tb per sample) —
                         // cloning the whole plane per TU would be O(TUs x W x H).
-                        let mut residual = vec![0i16; tu_size * tu_size];
+                        let mut residual = [0i16; 16];
                         for yy in 0..tu_size {
                             for xx in 0..tu_size {
                                 let idx = residual_index(tu_size, xx, yy);
@@ -722,8 +722,9 @@ impl Encoder {
                                     .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                             }
                         }
+                        let n = tu_size * tu_size;
                         let (c_inter, r_inter) = encode_tu_residual(
-                            &residual, &table_inter, &forward0,
+                            &residual[..n], &table_inter, &forward0,
                             TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
                         let mut sse_inter = 0i64;
                         for yy in 0..tu_size {

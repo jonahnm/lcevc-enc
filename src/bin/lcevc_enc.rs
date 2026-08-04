@@ -105,6 +105,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut mux_out: Option<String> = None;
     let mut mux_only = false;
     let mut base_gop = 30usize;
+    let mut base_gop_seconds: Option<f64> = None;
     let mut target_kbps: Option<u32> = None;
     let mut qm_beta: f64 = 0.3;
     let mut vvc_preset = "medium".to_string();
@@ -181,6 +182,7 @@ fn run(args: &[String]) -> Result<(), String> {
             "--mux" => mux_out = Some(next(&mut i)?),
             "--mux-only" => mux_only = true,
             "--base-gop" => base_gop = next(&mut i)?.parse().map_err(|_| "bad base-gop")?,
+            "--base-gop-seconds" => base_gop_seconds = Some(next(&mut i)?.parse().map_err(|_| "bad base-gop-seconds")?),
             "--target-kbps" => target_kbps = Some(next(&mut i)?.parse().map_err(|_| "bad target-kbps")?),
             "--qm-beta" => qm_beta = next(&mut i)?.parse().map_err(|_| "bad qm-beta")?,
             "--vvc-preset" => vvc_preset = next(&mut i)?,
@@ -288,6 +290,25 @@ fn run(args: &[String]) -> Result<(), String> {
     }
     if width == 0 || height == 0 {
         return Err(format!("missing size\n{}", usage()));
+    }
+    // --base-gop-seconds: GOP size in seconds (resolved against the stream
+    // frame rate once the Y4M header is known).
+    if let Some(secs) = base_gop_seconds {
+        let rate = if fps > 0 {
+            fps as f64
+        } else if let FrameSource::Y4m(r) = &frame_source {
+            if r.fps_num != 0 {
+                r.fps_num as f64 / r.fps_den as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        if rate <= 0.0 {
+            return Err("--base-gop-seconds needs the frame rate (Y4M header or --fps)".into());
+        }
+        base_gop = (secs * rate).ceil().max(1.0) as usize;
     }
 
     let mut cfg = LcevcConfig {
@@ -442,7 +463,7 @@ fn run(args: &[String]) -> Result<(), String> {
     'outer: loop {
         // Read one GOP of source frames.
         let mut gop_frames: Vec<lcevc_enc::frame::Picture> = Vec::new();
-        while gop_frames.len() < gop_size && frame_count < frames {
+        while gop_frames.len() < gop_size && frame_count as usize + gop_frames.len() < frames as usize {
             let frame = match &mut frame_source {
                 FrameSource::Raw(f) => {
                     yuv::read_yuv420_frame_file(&mut **f, width as usize, height as usize, bit_depth)?

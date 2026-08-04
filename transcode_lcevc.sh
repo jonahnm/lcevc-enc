@@ -13,17 +13,21 @@
 #   OUTPUT_BASE.base.266   raw VVC base bitstream
 #
 # Options:
-#   --target-kbps N    rate-control the enhancement toward N kbps
-#                      (default: fixed step widths 1024/256)
-#   --audio            remux the source audio into the output MP4 (needs
-#                      the system ffmpeg; uses stream copy, no re-encode)
-#   anything else      passed through to lcevc_enc (e.g. --frames N,
-#                      --temporal on --temporal-sw-modifier 24 for temporal
-#                      prediction, --scaling-l1 2 for a quarter-res base)
+#   --target-kbps N       rate-control the enhancement toward N kbps
+#                         (default: fixed step widths 1024/256)
+#   --keyframe-interval N keyframe (GOP) interval in seconds; the base is
+#                         encoded per GOP (one vvenc invocation per group)
+#   --scale WxH           downscale the video before encoding (e.g. 3840x2160
+#                         for an 8K source; an 8K encode is ~4x slower)
+#   --audio               remux the source audio into the output MP4 (needs
+#                         the system ffmpeg; uses stream copy, no re-encode)
+#   anything else         passed through to lcevc_enc (e.g. --frames N,
+#                         --temporal on --temporal-sw-modifier 24 for temporal
+#                         prediction, --scaling-l1 2 for a quarter-res base)
 #
-# The VVC base is encoded per GOP (--base-gop 30, one vvenc invocation per
-# group for inter prediction). Temporal prediction is off by default; it
-# costs ~50% encode time for ~+0.1 dB and can be enabled by passing
+# The total frame count is probed (ffprobe) so the progress line shows
+# N/M with ETA. Temporal prediction is off by default; it costs ~50% encode
+# time for ~+0.1 dB and can be enabled by passing
 # --temporal on --temporal-sw-modifier 24 as extra args.
 #
 # Environment:
@@ -53,6 +57,8 @@ fi
 
 TARGET=""
 AUDIO=0
+KEYFRAME=""
+SCALE=""
 ENCODE_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -63,6 +69,14 @@ while [ $# -gt 0 ]; do
         --audio)
             AUDIO=1
             shift
+            ;;
+        --keyframe-interval)
+            KEYFRAME="$2"
+            shift 2
+            ;;
+        --scale)
+            SCALE="$2"
+            shift 2
             ;;
         *)
             ENCODE_ARGS+=("$1")
@@ -83,7 +97,32 @@ case "$PF" in
     *)              DEPTH=8;  PIXFMT="yuv420p";     FORMAT="yuv420p" ;;
 esac
 
-echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, half-res pyramid) =="
+# --- detect the total frame count (for the N/M progress + ETA) ---
+TOTAL_FRAMES="$("$FFPROBE" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"
+if [ -z "$TOTAL_FRAMES" ] || [ "$TOTAL_FRAMES" = "N/A" ] || ! [ "$TOTAL_FRAMES" -gt 0 ] 2>/dev/null; then
+    DUR="$("$FFPROBE" -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"
+    FPS="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"
+    if [ -n "$DUR" ] && [ -n "$FPS" ]; then
+        case "$FPS" in
+            */*) FN="${FPS%%/*}"; FD="${FPS##*/}"; TOTAL_FRAMES=$(awk -v d="$DUR" -v n="$FN" -v m="$FD" 'BEGIN { printf "%d", d*n/m }') ;;
+            *)   TOTAL_FRAMES=$(awk -v d="$DUR" -v f="$FPS" 'BEGIN { printf "%d", d*f }') ;;
+        esac
+    fi
+fi
+FRAMES_ARG=()
+if [ -n "$TOTAL_FRAMES" ] && [ "$TOTAL_FRAMES" -gt 0 ] 2>/dev/null; then
+    FRAMES_ARG+=(--frames "$TOTAL_FRAMES")
+fi
+
+VFILTER="scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=${FORMAT}"
+if [ -n "$SCALE" ]; then
+    VFILTER="scale=${SCALE}:flags=lanczos,format=${FORMAT}"
+fi
+
+GOP_ARGS=()
+[ -n "$KEYFRAME" ] && GOP_ARGS+=(--base-gop-seconds "$KEYFRAME")
+
+echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, half-res pyramid, ${TOTAL_FRAMES:-?} frames) =="
 
 TARGET_ARGS=()
 [ -n "$TARGET" ] && TARGET_ARGS+=(--target-kbps "$TARGET")
@@ -92,7 +131,7 @@ set -o pipefail
 "$FFMPEG" -hide_banner -loglevel error \
     -i "$INPUT" \
     -map 0:v:0 -an \
-    -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=${FORMAT}" \
+    -vf "$VFILTER" \
     -fps_mode cfr \
     -f yuv4mpegpipe -strict -1 -pix_fmt "$PIXFMT" - |
     "$LCEVC_ENC" -i - --input-format y4m --bit-depth "$DEPTH" \
@@ -104,6 +143,8 @@ set -o pipefail
         --qm-beta 0.3 \
         --step-width-l1 1024 --step-width-l2 256 \
         --no-psnr \
+        "${FRAMES_ARG[@]}" \
+        "${GOP_ARGS[@]}" \
         "${TARGET_ARGS[@]}" \
         --base-out "${OUT}.base.266" -o "${OUT}.lcevc" \
         --mux "${OUT}.mp4" \

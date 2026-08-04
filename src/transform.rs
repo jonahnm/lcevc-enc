@@ -228,36 +228,57 @@ impl ForwardTransform {
         }
     }
 
-    /// Apply the forward transform; returns (numerators, denominator).
-    pub fn apply(&self, r: &[i16]) -> (Vec<i32>, i32) {
+    /// Number of transform layers (4 for DD, 16 for DDS).
+    pub fn layers(&self) -> usize {
+        match self {
+            ForwardTransform::Dd1D | ForwardTransform::Dd2D => 4,
+            ForwardTransform::Dds1D | ForwardTransform::Dds2D => 16,
+        }
+    }
+
+    /// Apply the forward transform; returns (numerators, denominator) as
+    /// fixed-size arrays (DD fills only the first 4 entries).
+    pub fn apply(&self, r: &[i16]) -> ([i32; 16], i32) {
         match self {
             ForwardTransform::Dd1D => {
                 let (c, d) = forward_dd_1d(r.try_into().unwrap());
-                (c.to_vec(), d)
+                let mut out = [0i32; 16];
+                out[..4].copy_from_slice(&c);
+                (out, d)
             }
             ForwardTransform::Dd2D => {
                 let (c, d) = forward_dd_2d(r.try_into().unwrap());
-                (c.to_vec(), d)
+                let mut out = [0i32; 16];
+                out[..4].copy_from_slice(&c);
+                (out, d)
             }
             ForwardTransform::Dds1D => {
                 let (c, d) = forward_dds_1d(r.try_into().unwrap());
-                (c.to_vec(), d)
+                (c, d)
             }
             ForwardTransform::Dds2D => {
                 let (c, d) = forward_dds_2d(r.try_into().unwrap());
-                (c.to_vec(), d)
+                (c, d)
             }
         }
     }
 
     /// Apply the decoder-mirror inverse transform (used in the reconstruction
     /// loop and by tests).
-    pub fn inverse(&self, c: &[i16]) -> Vec<i16> {
+    pub fn inverse(&self, c: &[i16]) -> [i16; 16] {
         match self {
-            ForwardTransform::Dd1D => inverse_dd_1d(c.try_into().unwrap()).to_vec(),
-            ForwardTransform::Dd2D => inverse_dd_2d(c.try_into().unwrap()).to_vec(),
-            ForwardTransform::Dds1D => inverse_dds_1d(c.try_into().unwrap()).to_vec(),
-            ForwardTransform::Dds2D => inverse_dds_2d(c.try_into().unwrap()).to_vec(),
+            ForwardTransform::Dd1D => {
+                let mut out = [0i16; 16];
+                out[..4].copy_from_slice(&inverse_dd_1d(c.try_into().unwrap()));
+                out
+            }
+            ForwardTransform::Dd2D => {
+                let mut out = [0i16; 16];
+                out[..4].copy_from_slice(&inverse_dd_2d(c.try_into().unwrap()));
+                out
+            }
+            ForwardTransform::Dds1D => inverse_dds_1d(c.try_into().unwrap()),
+            ForwardTransform::Dds2D => inverse_dds_2d(c.try_into().unwrap()),
         }
     }
 }

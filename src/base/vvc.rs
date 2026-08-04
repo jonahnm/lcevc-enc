@@ -57,7 +57,11 @@ pub fn encode_decode_vvc_gop(
         }
     }
     let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
-    let vvenc_params = if depth == 10 { "InternalBitDepth=10,InputBitDepth=10" } else { "InternalBitDepth=8,InputBitDepth=8" };
+    let vvenc_params = format!(
+        "{}Threads={}",
+        if depth == 10 { "InternalBitDepth=10,InputBitDepth=10," } else { "InternalBitDepth=8,InputBitDepth=8," },
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+    );
 
     let status = std::process::Command::new("ffmpeg")
         .args([
@@ -67,7 +71,7 @@ pub fn encode_decode_vvc_gop(
             "-r", "25",
             "-i", base_yuv.to_str().unwrap(),
             "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
-            "-vvenc-params", vvenc_params,
+            "-vvenc-params", &vvenc_params,
             base_vvc.to_str().unwrap(),
         ])
         .stdin(std::process::Stdio::null())
@@ -175,7 +179,11 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
         }
     }
     let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
-    let vvenc_params = if depth == 10 { "InternalBitDepth=10,InputBitDepth=10" } else { "InternalBitDepth=8,InputBitDepth=8" };
+    let vvenc_params = format!(
+        "{}Threads={}",
+        if depth == 10 { "InternalBitDepth=10,InputBitDepth=10," } else { "InternalBitDepth=8,InputBitDepth=8," },
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+    );
     let status = Command::new("ffmpeg")
         .args([
             "-hide_banner", "-loglevel", "error", "-y",
@@ -183,7 +191,7 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
             "-s", &format!("{width}x{height}"),
             "-i", base_yuv.to_str().unwrap(),
             "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
-            "-vvenc-params", vvenc_params,
+            "-vvenc-params", &vvenc_params,
             base_vvc.to_str().unwrap(),
         ])
         .stdin(Stdio::null())
