@@ -35,8 +35,7 @@ fn main() {
     }
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    status.push_str(&format!("vendored vvenc: {}
-", VVENC_VERSION));
+    status.push_str(&format!("vendored vvenc: {}\n", VVENC_VERSION));
     let target = env::var("TARGET").unwrap();
 
     // version.h is generated from version.h.in by the vvenc build.
@@ -58,8 +57,7 @@ fn main() {
         finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
     }
-    status.push_str(&format!("sources: {} files
-", files.len()));
+    status.push_str(&format!("sources: {} files\n", files.len()));
 
     // Locate the C++ compiler.
     let compiler = find_compiler(&target);
@@ -69,8 +67,14 @@ fn main() {
         finish_status(&status_file, &format!("FALLBACK: {msg}"));
         return;
     };
-    status.push_str(&format!("compiler: {}
-", cc.cxx.display()));
+    status.push_str(&format!(
+        "compiler: {} ({})\n",
+        cc.cxx.display(),
+        match cc.kind {
+            CompilerKind::Msvc => "msvc",
+            CompilerKind::Gnu => "gnu",
+        }
+    ));
 
     let objdir = out.join("vvenc_obj");
     std::fs::create_dir_all(&objdir).ok();
@@ -106,8 +110,7 @@ fn main() {
         failed = true;
     }
     if !failed {
-        status.push_str(&format!("objects: {}
-", objs.len()));
+        status.push_str(&format!("objects: {}\n", objs.len()));
     }
     if failed {
         let msg = format!("vvenc static build failed (see the compile errors above)");
