@@ -426,9 +426,11 @@ mod simd_tests {
         let kernel: [i16; 4] = [-2360, 15855, 4165, -1276];
         for seed in 0..50u64 {
             let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // Realistic fixed-point samples are in [-16384, 16383]; the
+            // full i16 range would overflow the scalar i32 accumulation.
             let gen = |rng: &mut u64| -> i16 {
                 *rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                ((*rng >> 33) % 65536) as i16
+                (((*rng >> 33) % 32768) as i16) - 16384
             };
             let s0 = [gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng)];
             let s1 = [gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng), gen(&mut rng)];
