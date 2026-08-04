@@ -536,26 +536,57 @@ fn process_plane(
                 vec![vec![Vec::new(); num_layers]; n_l1_tiles];
             let mut l1_runs: Vec<Vec<u32>> = vec![vec![0; num_layers]; n_l1_tiles];
             let mut energy_l1 = [0.0f64; 16];
-            process_loq_tiles(
-                cfg, 1, plane, |tu_state, i, _| {
-                    tu_state.surface_or_block_position(i, tu_order)
-                },
-                &mut |x, y, tile| {
-                    let (coeffs, residual) = encode_tu(
-                        &l1_target_s16, &l1_pred, &table1, &forward1, tu_size, x, y,
-                        TemporalSignal::Inter, deblock,
-                        cfg.level1_filtering_first_coefficient,
-                        cfg.level1_filtering_second_coefficient,
-                        &mut energy_l1, rdoq,
-                    );
-                    commit_residual(&mut l1_recon, x, y, tu_size, &residual);
+            if !cfg.is_tiled() {
+                let tus_x = l1_target_s16.width / tu_size;
+                let tus_y = l1_target_s16.height / tu_size;
+                let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let results = process_tu_rows_parallel(
+                    tus_x, tus_y, tu_size, num_layers, nthreads,
+                    &|x, y, events, runs, residuals, energy| {
+                        let (coeffs, residual) = encode_tu(
+                            &l1_target_s16, &l1_pred, &table1, &forward1, tu_size, x, y,
+                            TemporalSignal::Inter, deblock,
+                            cfg.level1_filtering_first_coefficient,
+                            cfg.level1_filtering_second_coefficient,
+                            energy, rdoq,
+                        );
+                        for l in 0..num_layers {
+                            push_coeff(&mut events[l], &mut runs[l], coeffs[l]);
+                        }
+                        residuals.push((x, y, residual));
+                    },
+                );
+                for (mut events, residuals, energy) in results {
+                    for (x, y, residual) in residuals {
+                        commit_residual(&mut l1_recon, x, y, tu_size, &residual);
+                    }
                     for l in 0..num_layers {
-                        push_coeff(&mut l1_events[tile][l], &mut l1_runs[tile][l], coeffs[l]);
+                        l1_events[0][l].extend(std::mem::take(&mut events[l]));
                     }
-                    if plane == 0 && x == 0 && y == 0 {
+                    for l in 0..num_layers {
+                        energy_l1[l] += energy[l];
                     }
-                },
-            )?;
+                }
+            } else {
+                process_loq_tiles(
+                    cfg, 1, plane, |tu_state, i, _| {
+                        tu_state.surface_or_block_position(i, tu_order)
+                    },
+                    &mut |x, y, tile| {
+                        let (coeffs, residual) = encode_tu(
+                            &l1_target_s16, &l1_pred, &table1, &forward1, tu_size, x, y,
+                            TemporalSignal::Inter, deblock,
+                            cfg.level1_filtering_first_coefficient,
+                            cfg.level1_filtering_second_coefficient,
+                            &mut energy_l1, rdoq,
+                        );
+                        commit_residual(&mut l1_recon, x, y, tu_size, &residual);
+                        for l in 0..num_layers {
+                            push_coeff(&mut l1_events[tile][l], &mut l1_runs[tile][l], coeffs[l]);
+                        }
+                    },
+                )?;
+            }
 
             // ---- LOQ0 (L2) ----
             let l2_pred = upscale_plane(&l1_recon, cfg.scaling_l2, &kernel, apply_pa);
@@ -593,6 +624,34 @@ fn process_plane(
                 temporal_runs.push(Vec::new());
             }
 
+            if !temporal_enabled && !cfg.is_tiled() {
+                let tus_x = src_s16.width / tu_size;
+                let tus_y = src_s16.height / tu_size;
+                let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let results = process_tu_rows_parallel(
+                    tus_x, tus_y, tu_size, num_layers, nthreads,
+                    &|x, y, events, runs, residuals, energy| {
+                        let (coeffs, residual) = encode_tu(
+                            &src_s16, &l2_pred, &table_inter, &forward0, tu_size, x, y,
+                            TemporalSignal::Inter, false, 0, 0, energy, rdoq);
+                        for l in 0..num_layers {
+                            push_coeff(&mut events[l], &mut runs[l], coeffs[l]);
+                        }
+                        residuals.push((x, y, residual));
+                    },
+                );
+                for (mut events, residuals, energy) in results {
+                    for (x, y, residual) in residuals {
+                        commit_residual(&mut l2_recon, x, y, tu_size, &residual);
+                    }
+                    for l in 0..num_layers {
+                        l2_events[0][l].extend(std::mem::take(&mut events[l]));
+                    }
+                    for l in 0..num_layers {
+                        energy_l2[l] += energy[l];
+                    }
+                }
+            } else {
             process_loq_tiles(
                 cfg, 0, plane, |tu_state, i, _| {
                     tu_state.surface_or_block_position(i, tu_order)
@@ -666,8 +725,8 @@ fn process_plane(
                         runs.push(TemporalRun { signal: signal as u8, count: 1 });
                     }
                 },
-            )?;
-
+                )?;
+            }
 
             for l in 0..num_layers {
                 energy_l1[l] = energy_l1[l];
@@ -1083,6 +1142,50 @@ impl TuState {
 }
 
 /// Iterate over the tiles of a LOQ for one plane, invoking `op` for every TU.
+
+/// Process the TUs of a plane in parallel row-chunks. Each chunk computes
+/// its coefficients/reconstructions independently (TUs only share the final
+/// plane, which is assembled serially afterwards). The zero-run state is
+/// per-chunk, so runs are split at chunk boundaries - semantically identical
+/// for the decoder, slightly different entropy packing.
+#[allow(clippy::type_complexity)]
+fn process_tu_rows_parallel(
+    tus_x: usize,
+    tus_y: usize,
+    tu_size: usize,
+    num_layers: usize,
+    nthreads: usize,
+    op: &(impl Fn(usize, usize, &mut Vec<Vec<CoeffEvent>>, &mut Vec<u32>, &mut Vec<(usize, usize, [i16; 16])>, &mut [f64]) + Sync),
+) -> Vec<(Vec<Vec<CoeffEvent>>, Vec<(usize, usize, [i16; 16])>, [f64; 16])> {
+    let rows_per_thread = (tus_y + nthreads - 1) / nthreads;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|t| {
+                let y0 = t * rows_per_thread;
+                let y1 = (y0 + rows_per_thread).min(tus_y);
+                s.spawn(move || {
+                    let mut events: Vec<Vec<CoeffEvent>> = vec![Vec::new(); num_layers];
+                    let mut runs: Vec<u32> = vec![0; num_layers];
+                    let mut residuals: Vec<(usize, usize, [i16; 16])> = Vec::new();
+                    let mut energy = [0.0f64; 16];
+                    for ty in y0..y1 {
+                        let y = ty * tu_size;
+                        for tx in 0..tus_x {
+                            let x = tx * tu_size;
+                            op(x, y, &mut events, &mut runs, &mut residuals, &mut energy);
+                        }
+                    }
+                    for l in 0..num_layers {
+                        flush_run(&mut events[l], runs[l]);
+                    }
+                    (events, residuals, energy)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
 fn process_loq_tiles<F>(
     cfg: &LcevcConfig,
     loq: usize,
