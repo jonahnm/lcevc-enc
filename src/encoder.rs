@@ -74,9 +74,11 @@ pub struct Encoder {
     frame_index: u32,
     temporal_buffers: Vec<PlaneS16>, // per plane at LOQ0 resolution
 
-    // Rate-control state: the last chosen step widths (per picture).
+    // Rate-control state: the last chosen step widths (per picture) and
+    // the payload size they produced.
     rc_prev_sw1: u32,
     rc_prev_sw2: u32,
+    rc_prev_size: usize,
 
     /// Content-adaptive quant-matrix exponent (0 = keep the default).
     pub qm_beta: f64,
@@ -835,6 +837,7 @@ impl Encoder {
             temporal_buffers,
             rc_prev_sw1: step_width_l1,
             rc_prev_sw2: step_width_l2,
+            rc_prev_size: 0,
             qm_beta: 0.3,
             rdoq: true,
         }
@@ -862,91 +865,42 @@ impl Encoder {
         self.encode_frame_with_base(source, &base_picture)
     }
 
-    /// Rate-controlled encode: search the L1/L2 step widths so the payload
-    /// fits `target_bytes`. Most frames reuse the previous frame's step
-    /// widths (content changes slowly), so the typical cost is ONE full
-    /// encode; a size-vs-step interpolation and a short binary search cover
-    /// the rest.
+    /// Rate-controlled encode with ZERO search cost: the step widths for
+    /// this frame are interpolated from the previous frame's measured
+    /// payload size (size ~ C/sw^2), so it is exactly one full encode per
+    /// frame - the same cost as fixed step widths - while the bitrate
+    /// tracks the target with one frame of lag.
     pub fn encode_frame_rc(
         &mut self,
         source: &Picture,
         base_picture: &Picture,
         target_bytes: usize,
     ) -> Result<(EncodedFrame, u32, u32), String> {
-        let tb_backup = self.temporal_buffers.clone();
-        let try_sw = |enc: &mut Self, sw1: u32, sw2: u32|
-            -> Result<(EncodedFrame, usize), String> {
-            let idx = enc.frame_index;
-            let stats = enc.stats.clone();
-            enc.temporal_buffers = tb_backup.clone();
-            let frame = enc.encode_frame_inner(source, base_picture, sw1, sw2)?;
-            let size = frame.picture_config.len() + frame.encoded_data.len();
-            enc.frame_index = idx;
-            enc.stats = stats;
-            Ok((frame, size))
-        };
-        let fits = |size: usize| size <= target_bytes;
-        // Keep the finest fitting candidate; if none fits, the smallest.
-        let consider = |best: &mut Option<(EncodedFrame, u32, u32, usize)>,
-                        frame: EncodedFrame,
-                        sw1: u32,
-                        sw2: u32,
-                        size: usize| {
-            match best {
-                None => *best = Some((frame, sw1, sw2, size)),
-                Some((_, _, _, bsize)) => {
-                    let bf = fits(*bsize);
-                    let f = fits(size);
-                    if (f && !bf) || (f == bf && ((f && size > *bsize) || (!f && size < *bsize))) {
-                        *best = Some((frame, sw1, sw2, size));
-                    }
-                }
-            }
-        };
-
-        let mut best: Option<(EncodedFrame, u32, u32, usize)> = None;
         let t = target_bytes.max(1) as f64;
-
-        // 1. The previous frame's step widths (typically already right).
-        let (f, s) = try_sw(self, self.rc_prev_sw1, self.rc_prev_sw2)?;
-        consider(&mut best, f, self.rc_prev_sw1, self.rc_prev_sw2, s);
-        if (s as f64 / t - 1.0).abs() <= 0.25 {
-            let (frame, sw1, sw2, _) = best.unwrap();
-            self.rc_prev_sw1 = sw1;
-            self.rc_prev_sw2 = sw2;
-            return Ok((frame, sw1, sw2));
-        }
-
-        // 2. Interpolate: payload size ~ C / sw^2, so sw scales by
-        // (size/target)^0.5.
-        let k = (s as f64 / t).powf(0.5).clamp(0.25, 4.0);
+        let k = if self.rc_prev_size == 0 {
+            1.0
+        } else if (self.rc_prev_size as f64) < t / 20.0 {
+            // The previous frame was adaptively dropped (config-only
+            // payload): that is not a size signal, so go finer to engage
+            // the residual rather than interpreting it as "too small".
+            0.7
+        } else {
+            (self.rc_prev_size as f64 / t).powf(0.5).clamp(0.5, 2.0)
+        };
         let sw1 = ((self.rc_prev_sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
         let sw2 = ((self.rc_prev_sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
-        let (f, s) = try_sw(self, sw1, sw2)?;
-        consider(&mut best, f, sw1, sw2, s);
-        if (s as f64 / t - 1.0).abs() <= 0.1 {
-            let (frame, sw1, sw2, _) = best.unwrap();
-            self.rc_prev_sw1 = sw1;
-            self.rc_prev_sw2 = sw2;
-            return Ok((frame, sw1, sw2));
-        }
 
-        // 3. One interpolation refinement (size ~ C/sw^2) and accept
-        //    unconditionally: a re-search is at most two encodes, so the
-        //    per-frame cost stays uniform even when the content changes.
-        let (f, s) = try_sw(self, sw1, sw2)?;
-        consider(&mut best, f, sw1, sw2, s);
-        if (s as f64 / t - 1.0).abs() > 0.1 {
-            let k = (s as f64 / t).powf(0.5).clamp(0.5, 2.0);
-            let sw1 = ((sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
-            let sw2 = ((sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
-            let (f, s) = try_sw(self, sw1, sw2)?;
-            consider(&mut best, f, sw1, sw2, s);
-        }
+        let idx = self.frame_index;
+        let stats = self.stats.clone();
+        self.temporal_buffers = std::mem::take(&mut self.temporal_buffers);
+        let frame = self.encode_frame_inner(source, base_picture, sw1, sw2)?;
+        let size = frame.picture_config.len() + frame.encoded_data.len();
+        self.frame_index = idx;
+        self.stats = stats;
 
-        let (frame, sw1, sw2, _) = best.unwrap();
         self.rc_prev_sw1 = sw1;
         self.rc_prev_sw2 = sw2;
+        self.rc_prev_size = size;
         Ok((frame, sw1, sw2))
     }
 
