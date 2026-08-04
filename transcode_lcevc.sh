@@ -55,6 +55,10 @@ if [ -z "$OUT" ]; then
     OUT="${INPUT##*/}"
     OUT="${OUT%.*}"
 fi
+# strip a trailing .mp4 if the user passed the full output name
+case "$OUT" in
+    *.mp4) OUT="${OUT%.mp4}" ;;
+esac
 
 TARGET=""
 AUDIO=0
@@ -97,8 +101,8 @@ if [ ! -x "$LCEVC_ENC" ]; then
 fi
 
 # --- detect the source bit depth (10-bit HDR keeps 10 bits; anything else 8) ---
-PF="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "$INPUT" 2>/dev/null || true)"
-BITS="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"
+PF="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null || true)"
+BITS="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1 || true)"
 DEPTH=8
 PIXFMT="yuv420p"
 FORMAT="yuv420p"
@@ -124,10 +128,15 @@ fi
 echo "== detected: pix_fmt=${PF:-unknown}, bits_per_raw_sample=${BITS:-N/A} -> ${DEPTH}-bit pipeline =="
 
 # --- detect the total frame count (for the N/M progress + ETA) ---
-TOTAL_FRAMES="$("$FFPROBE" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"
+TOTAL_FRAMES=""
+case "${INPUT##*.}" in
+    mp4|mov|m4v)
+        TOTAL_FRAMES="$("$FFPROBE" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1 || true)"
+        ;;
+esac
 if [ -z "$TOTAL_FRAMES" ] || [ "$TOTAL_FRAMES" = "N/A" ] || ! [ "$TOTAL_FRAMES" -gt 0 ] 2>/dev/null; then
-    DUR="$("$FFPROBE" -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"
-    FPS="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$INPUT" 2>/dev/null | head -1 || true)"
+    DUR="$("$FFPROBE" -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1 || true)"
+    FPS="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1 || true)"
     if [ -n "$DUR" ] && [ -n "$FPS" ]; then
         case "$FPS" in
             */*) FN="${FPS%%/*}"; FD="${FPS##*/}"; TOTAL_FRAMES=$(awk -v d="$DUR" -v n="$FN" -v m="$FD" 'BEGIN { printf "%d", d*n/m }') ;;

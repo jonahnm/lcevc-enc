@@ -47,6 +47,7 @@ if not "%~1"=="" (
     )
 )
 if not defined OUT set "OUT=%~n1"
+if /i "!OUT:~-4!"==".mp4" set "OUT=!OUT:~0,-4!"
 
 set "TARGET="
 set "AUDIO=0"
@@ -103,9 +104,9 @@ set "PF="
 set "BITS="
 rem Use temp files instead of for /f: cmd's for /f parsing breaks on
 rem filenames containing parentheses/brackets.
-"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "%INPUT%" > "%TEMP%\lcevc_pf.txt" 2>nul
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=pix_fmt -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_pf.txt" 2>nul
 if exist "%TEMP%\lcevc_pf.txt" set /p PF=<"%TEMP%\lcevc_pf.txt"
-"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of csv=p=0 "%INPUT%" > "%TEMP%\lcevc_bits.txt" 2>nul
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=bits_per_raw_sample -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_bits.txt" 2>nul
 if exist "%TEMP%\lcevc_bits.txt" set /p BITS=<"%TEMP%\lcevc_bits.txt"
 del /q "%TEMP%\lcevc_pf.txt" "%TEMP%\lcevc_bits.txt" 2>nul
 echo !BITS! | findstr /r "10 12 14 16" >nul && (
@@ -130,15 +131,18 @@ echo == detected: pix_fmt=%PF%, bits_per_raw_sample=%BITS% -^> !DEPTH!-bit pipel
 
 rem --- detect the total frame count (for the N/M progress + ETA) ---
 set "TOTAL_FRAMES="
-"%FFPROBE%" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 "%INPUT%" > "%TEMP%\lcevc_frames.txt" 2>nul
-if exist "%TEMP%\lcevc_frames.txt" set /p TOTAL_FRAMES=<"%TEMP%\lcevc_frames.txt"
+set "EXT=%~x1"
+if /i "%EXT%"==".mp4" (
+    "%FFPROBE%" -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_frames.txt" 2>nul
+    if exist "%TEMP%\lcevc_frames.txt" set /p TOTAL_FRAMES=<"%TEMP%\lcevc_frames.txt"
+)
 if not defined TOTAL_FRAMES (
     rem fallback: duration x fps (integer arithmetic)
     set "DUR="
-    for /f "delims=." %%a in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "%INPUT%" 2^>nul') do set "DUR=%%a"
+    for /f "delims=." %%a in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "%INPUT%" 2^>nul') do set "DUR=%%a"
     set "FNUM="
     set "FDEN=1"
-    for /f "tokens=1,2 delims=/" %%n in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "%INPUT%" 2^>nul') do (
+    for /f "tokens=1,2 delims=/" %%n in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "%INPUT%" 2^>nul') do (
         set "FNUM=%%n"
         set "FDEN=%%m"
     )
