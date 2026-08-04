@@ -8,6 +8,239 @@ use crate::config::LcevcConfig;
 use crate::frame::Picture;
 use std::process::{Command, Stdio};
 
+
+/// Continuous base-codec stream: a long-running vvenc encoder instance
+/// (the library, loaded at runtime) feeds a VVC decoder subprocess, so the
+/// enhancement can consume decoded base frames one at a time with bounded
+/// memory regardless of the keyframe interval. The intra period is set by
+/// `refresh_sec` (e.g. 10 = a keyframe every 10 seconds).
+pub struct VvcStreamer {
+    lib: Option<crate::base::vvenc_lib::VvencLib>,
+    decode: std::process::Child,
+    queue: std::sync::Arc<crate::base::vvenc_lib::DecodedQueue>,
+    pump: Option<std::thread::JoinHandle<Result<(), String>>>,
+    decode_stdin: Option<std::process::ChildStdin>,
+    base_file: Option<std::fs::File>,
+    width: usize,
+    height: usize,
+    pad_w: usize,
+    pad_h: usize,
+    sent: u64,
+}
+
+impl VvcStreamer {
+    pub fn start(
+        cfg: &LcevcConfig,
+        base_out: Option<&str>,
+        refresh_sec: u32,
+    ) -> Result<VvcStreamer, String> {
+        let (bw, bh) = {
+            let d = cfg.loq_dimensions();
+            (d[2].0 as usize, d[2].1 as usize)
+        };
+        // The vvenc library requires 16x16-aligned picture dimensions, so
+        // the base is padded before encoding and cropped back after decode.
+        let pad_w = (bw + 15) / 16 * 16;
+        let pad_h = (bh + 15) / 16 * 16;
+        let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let mut lib = crate::base::vvenc_lib::VvencLib::new(
+            pad_w, pad_h, 25, 24, ncpu as i32, refresh_sec.max(1) as i32, cfg.colour.as_ref(),
+        )?;
+
+        let mut decode = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-i", "-",
+                "-f", "rawvideo", "-pix_fmt", "yuv420p10le",
+                "pipe:1",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("failed to start vvc decoder: {e}"))?;
+        let mut dec_in = decode.stdin.take().unwrap();
+        let dec_out = decode.stdout.take().unwrap();
+
+        // Decode pump: drains the decoder's stdout continuously so the
+        // decoder never blocks on its output (which would stall the encode
+        // side), and hands the decoded frames to the caller through a queue.
+        // The decoder outputs the PADDED picture; it is cropped back to the
+        // real base dimensions here.
+        let frame_bytes = (pad_w * pad_h + 2 * ((pad_w / 2) * (pad_h / 2))) * 2;
+        let queue = crate::base::vvenc_lib::DecodedQueue::new();
+        let q2 = queue.clone();
+        let pump = std::thread::spawn(move || -> Result<(), String> {
+            use std::io::Read;
+            let mut dec_out = dec_out;
+            let mut buf = vec![0u8; frame_bytes];
+            loop {
+                let mut got = 0usize;
+                while got < frame_bytes {
+                    let n = dec_out
+                        .read(&mut buf[got..])
+                        .map_err(|e| format!("vvc decode read: {e}"))?;
+                    if n == 0 {
+                        q2.end();
+                        return Ok(());
+                    }
+                    got += n;
+                }
+                q2.push(crop_padded(&buf, pad_w, pad_h, bw, bh));
+            }
+        });
+
+        let mut base_file = base_out.map(|p| {
+            std::fs::File::create(p).map_err(|e| format!("failed to open base output: {e}"))
+        }).transpose()?;
+
+        // The encoder does not attach the parameter sets to the first
+        // frame's access unit; fetch them and write them up front.
+        let headers = lib.get_headers()?;
+        {
+            use std::io::Write;
+            if let Some(f) = base_file.as_mut() {
+                f.write_all(&headers).map_err(|e| e.to_string())?;
+            }
+            dec_in.write_all(&headers).map_err(|e| e.to_string())?;
+        }
+
+        Ok(VvcStreamer {
+            lib: Some(lib),
+            decode,
+            queue,
+            pump: Some(pump),
+            decode_stdin: Some(dec_in),
+            base_file,
+            width: bw,
+            height: bh,
+            pad_w,
+            pad_h,
+            sent: 0,
+        })
+    }
+
+    /// Downscale one source frame and encode it; the access unit (if the
+    /// encoder emits one) is appended to the base file and handed to the
+    /// decoder.
+    pub fn send_frame(
+        &mut self,
+        frame: &crate::frame::Picture,
+        scaling_l1: crate::config::ScalingMode,
+        scaling_l2: crate::config::ScalingMode,
+    ) -> Result<(), String> {
+        let mut bp = crate::frame::Picture::new(self.width, self.height, crate::config::ChromaFormat::C420);
+        for p in 0..frame.planes.len() {
+            let l1 = crate::upscale::downscale_plane(&frame.planes[p], scaling_l2, 10);
+            let base_t = crate::upscale::downscale_plane(&l1, scaling_l1, 10);
+            bp.planes[p] = base_t;
+        }
+        // Pad each plane to the 16x16-aligned encode dimensions.
+        let mut padded: Vec<Vec<u16>> = Vec::new();
+        for p in 0..3 {
+            let pw = bp.planes[p].width;
+            let ph = bp.planes[p].height;
+            let ppw = if p == 0 { self.pad_w } else { self.pad_w / 2 };
+            let pph = if p == 0 { self.pad_h } else { self.pad_h / 2 };
+            let mut out = Vec::with_capacity(ppw * pph);
+            for row in 0..pph {
+                if row < ph {
+                    out.extend_from_slice(&bp.planes[p].data[row * pw..row * pw + pw]);
+                    out.resize(out.len() + (ppw - pw), 512);
+                } else {
+                    out.resize(out.len() + ppw, 512);
+                }
+            }
+            padded.push(out);
+        }
+        let mut planes: [&[u16]; 3] = [&[], &[], &[]];
+        let mut pw = [0i32; 3];
+        let mut ph = [0i32; 3];
+        for p in 0..3 {
+            planes[p] = &padded[p];
+            pw[p] = (if p == 0 { self.pad_w } else { self.pad_w / 2 }) as i32;
+            ph[p] = (if p == 0 { self.pad_h } else { self.pad_h / 2 }) as i32;
+        }
+        let lib = self.lib.as_mut().unwrap();
+        let au = lib.encode_frame(&planes, pw, ph)?;
+        if let Some(au) = au {
+            self.write_au(&au.data)?;
+        }
+        self.sent += 1;
+        Ok(())
+    }
+
+    fn write_au(&mut self, data: &[u8]) -> Result<(), String> {
+        use std::io::Write;
+        if let Some(f) = self.base_file.as_mut() {
+            f.write_all(data).map_err(|e| e.to_string())?;
+        }
+        if let Some(stdin) = self.decode_stdin.as_mut() {
+            stdin.write_all(data).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Receive one decoded base frame (presentation order), blocking until
+    /// it is available. Returns `None` when the stream has ended.
+    pub fn recv_frame(&mut self) -> Result<Option<crate::frame::Picture>, String> {
+        Ok(self.queue.pop())
+    }
+
+    /// Number of frames sent to the encoder.
+    pub fn sent(&self) -> u64 {
+        self.sent
+    }
+
+    /// Flush the encoder (delivering the remaining access units) and close
+    /// the decoder's input so it can emit its reordered backlog. The caller
+    /// drains the remaining decoded frames afterwards, then calls `finish`.
+    pub fn finish_flush(&mut self) -> Result<(), String> {
+        if let Some(lib) = self.lib.as_mut() {
+            for au in lib.flush()? {
+                self.write_au(&au.data)?;
+            }
+        }
+        self.decode_stdin.take();
+        Ok(())
+    }
+
+    /// Verify the decoder terminated cleanly.
+    pub fn finish(mut self) -> Result<(), String> {
+        if let Some(pump) = self.pump.take() {
+            pump.join().map_err(|_| "decode pump panicked".to_string())??;
+        }
+        let dec_status = self.decode.wait().map_err(|e| e.to_string())?;
+        if !dec_status.success() {
+            return Err("vvc stream decode failed".into());
+        }
+        Ok(())
+    }
+}
+
+/// Crop a padded yuv420p10le frame (pad_w x pad_h) to (w x h).
+fn crop_padded(buf: &[u8], pad_w: usize, pad_h: usize, w: usize, h: usize) -> crate::frame::Picture {
+    let mut pic = crate::frame::Picture::new(w, h, crate::config::ChromaFormat::C420);
+    let mut off = 0usize;
+    for (p, plane) in pic.planes.iter_mut().enumerate() {
+        let pw = if p == 0 { w } else { w / 2 };
+        let ph = if p == 0 { h } else { h / 2 };
+        let ppw = if p == 0 { pad_w } else { pad_w / 2 };
+        let pph = if p == 0 { pad_h } else { pad_h / 2 };
+        for row in 0..ph {
+            let src_start = off + row * ppw * 2;
+            let dst_start = row * pw;
+            for col in 0..pw {
+                let i = src_start + col * 2;
+                plane.data[dst_start + col] = u16::from_le_bytes([buf[i], buf[i + 1]]);
+            }
+        }
+        off += pph * ppw * 2;
+    }
+    pic
+}
+
+
 /// Encode a sequence (GOP) of base pictures with vvenc in a single
 /// invocation (inter prediction between frames) and decode the result.
 pub fn encode_decode_vvc_gop(
@@ -18,7 +251,6 @@ pub fn encode_decode_vvc_gop(
     if frames.is_empty() {
         return Ok(Vec::new());
     }
-    let depth = cfg.enhancement_depth;
     let width = frames[0].width as u32;
     let height = frames[0].height as u32;
     if width % 2 != 0 || height % 2 != 0 {

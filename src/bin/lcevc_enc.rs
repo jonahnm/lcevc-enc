@@ -532,37 +532,209 @@ fn run(args: &[String]) -> Result<(), String> {
     let gop_size = base_gop.max(1);
     let depth = cfg.sample_depth();
 
-    // Pipelined GOP processing: the vvenc base encode of GOP N+1 runs on a
-    // worker thread while the enhancement of GOP N is encoded, hiding most
-    // of the base-codec time behind the enhancement work.
-    let mut read_frames: u32 = 0;
-    // Sub-GOP pipelining granularity: the base encodes in chunks of this
-    // many frames, each overlapping the previous chunk's enhancement, so
-    // the base's latency is hidden even when it is slower than the
-    // enhancement.
-    let sub_gop = base_gop.min(10).max(1);
-    let mut base_task: Option<std::thread::JoinHandle<Result<Vec<lcevc_enc::frame::Picture>, String>>> = None;
-    let mut pending: Vec<lcevc_enc::frame::Picture> = Vec::new();
-    // Total-bitrate mode: the enhancement budget = the total budget minus
-    // the base codec's measured bitrate (base file growth per GOP).
-    let mut prev_base_size: u64 = 0;
-    let mut measure_base = |base_path: &str, n_frames: usize| -> Option<usize> {
-        let size = std::fs::metadata(base_path).map(|m| m.len()).unwrap_or(0);
-        let delta = size.saturating_sub(prev_base_size);
-        prev_base_size = size;
+    // Continuous base streaming: one long-running vvenc encode (raw YUV in
+    // via stdin, VVC out via a pipe) feeding a decoder whose output the
+    // enhancement consumes frame-by-frame. Memory stays bounded regardless
+    // of the keyframe interval (the vvenc intra period is refresh_sec).
+    let tb_for = |base_size: u64, n: u64| -> Option<usize> {
         if let Some(total) = total_kbps {
-            if n_frames > 0 {
-                let base_bps = delta * 8 * fps as u64 / n_frames as u64;
-                let budget = (total as u64 * 1000).saturating_sub(base_bps);
-                return Some(((budget / 8) / fps.max(1) as u64).max(1) as usize);
+            let base_bps = if n > 0 { base_size * 8 * fps as u64 / n } else { 0 };
+            let budget = (total as u64 * 1000).saturating_sub(base_bps);
+            return Some(((budget / 8) / fps.max(1) as u64).max(1) as usize);
+        }
+        target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
+    };
+
+        let mut read_count = 0u32;
+        let mut read_next = |frame_source: &mut FrameSource,
+                         width: u32,
+                         height: u32,
+                         bit_depth: u8,
+                         verify_frames: &mut Vec<lcevc_enc::frame::Picture>,
+                         verify: bool|
+         -> Result<Option<lcevc_enc::frame::Picture>, String> {
+            if read_count >= frames {
+                return Ok(None);
+            }
+            let frame = match frame_source {
+                FrameSource::Raw(f) => {
+                    yuv::read_yuv420_frame_file(&mut **f, width as usize, height as usize, bit_depth)?
+                }
+                FrameSource::Y4m(r) => r.next_frame()?,
+            };
+            if let Some(f) = &frame {
+                read_count += 1;
+                if verify && verify_frames.len() < 2 {
+                    verify_frames.push(f.clone());
+                }
+            }
+            Ok(frame)
+        };
+    if base_mode == "vvc" && gop_size > 1 {
+        let base_out_stream = if base_out_path.is_empty() { None } else { Some(base_out_path.as_str()) };
+        let refresh_sec = base_gop_seconds
+            .or_else(|| Some(base_gop as f64 / fps.max(1) as f64))
+            .unwrap_or(1.0)
+            .ceil()
+            .max(1.0) as u32;
+        let mut streamer = match lcevc_enc::base::VvcStreamer::start(&cfg, base_out_stream, refresh_sec) {
+            Ok(s) => s,
+            Err(e) => {
+                // The vvenc library is unavailable: fall back to chunked
+                // GOP encoding (a keyframe every `chunk` frames).
+                eprintln!("warning: streaming vvenc unavailable ({e}); using chunked GOP encoding");
+                let chunk = 10usize;
+                let mut gop_buf: Vec<lcevc_enc::frame::Picture> = Vec::new();
+                let mut chunk_count = 0u32;
+                let mut prev_size: u64 = 0;
+                loop {
+                    while gop_buf.len() < chunk {
+                        match read_next(&mut frame_source, width, height, bit_depth, &mut verify_frames, verify)? {
+                            Some(f) => gop_buf.push(f),
+                            None => break,
+                        }
+                    }
+                    if gop_buf.is_empty() {
+                        break;
+                    }
+                    let (bw, bh) = {
+                        let d = cfg.loq_dimensions();
+                        (d[2].0 as usize, d[2].1 as usize)
+                    };
+                    let mut base_gop: Vec<lcevc_enc::frame::Picture> = Vec::with_capacity(gop_buf.len());
+                    for f in &gop_buf {
+                        let mut bp = lcevc_enc::frame::Picture::new(bw, bh, cfg.chroma);
+                        for p in 0..cfg.num_planes() {
+                            let l1 = lcevc_enc::upscale::downscale_plane(&f.planes[p], cfg.scaling_l2, depth);
+                            let base_t = lcevc_enc::upscale::downscale_plane(&l1, cfg.scaling_l1, depth);
+                            bp.planes[p] = base_t;
+                        }
+                        base_gop.push(bp);
+                    }
+                    let base_out_opt = if base_out_path.is_empty() { None } else { Some(base_out_path.as_str()) };
+                    let decoded = lcevc_enc::base::encode_decode_base_gop(&cfg, &base_gop, base_out_opt)?;
+                    let size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
+                    let delta = size.saturating_sub(prev_size);
+                    prev_size = size;
+                    let tb = if let Some(total) = total_kbps {
+                        if !gop_buf.is_empty() {
+                            let base_bps = delta * 8 * fps as u64 / gop_buf.len() as u64;
+                            let budget = (total as u64 * 1000).saturating_sub(base_bps);
+                            Some(((budget / 8) / fps.max(1) as u64).max(1) as usize)
+                        } else {
+                            None
+                        }
+                    } else {
+                        target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
+                    };
+                    process_gop(
+                        &gop_buf, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
+                        frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
+                        &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
+                        &mut recon_dump,
+                    )?;
+                    chunk_count += 1;
+                    gop_buf.clear();
+                }
+                let _ = chunk_count;
+                return Ok(());
+            }
+        };
+        // Read-ahead queue: the VVC decoder's B-frame reordering delays its
+        // output by a few frames, so the encoder must stay ahead of the
+        // decoder (sending future frames) or the receive blocks forever.
+        let mut queue: std::collections::VecDeque<lcevc_enc::frame::Picture> =
+            std::collections::VecDeque::new();
+        let mut sent = 0u64;
+        let mut eof = false;
+        // The base pipeline's latency (the vvenc encoder's reorder holdback
+        // plus the decoder's) is several tens of frames, so the encoder
+        // must stay that far ahead of the decoder or the receive blocks
+        // forever. Prime the pipeline, then always send the next source
+        // frame before receiving, keeping the in-flight distance bounded.
+        for _ in 0..96 {
+            match read_next(&mut frame_source, width, height, bit_depth, &mut verify_frames, verify)? {
+                Some(f) => {
+                    streamer.send_frame(&f, cfg.scaling_l1, cfg.scaling_l2)?;
+                    queue.push_back(f);
+                    sent += 1;
+                }
+                None => {
+                    eof = true;
+                    break;
+                }
             }
         }
-        None
-    };
-    'outer: loop {
-        // Read one GOP of source frames.
-        let mut gop_frames: Vec<lcevc_enc::frame::Picture> = Vec::new();
-        while gop_frames.len() < gop_size && read_frames as usize + gop_frames.len() < frames as usize {
+        loop {
+            if !eof {
+                match read_next(&mut frame_source, width, height, bit_depth, &mut verify_frames, verify)? {
+                    Some(f) => {
+                        streamer.send_frame(&f, cfg.scaling_l1, cfg.scaling_l2)?;
+                        queue.push_back(f);
+                        sent += 1;
+                    }
+                    None => eof = true,
+                }
+            } else {
+                // Source exhausted: the pipeline still holds ~90 frames in
+                // flight, but the decoder can only release them once the
+                // encoder is flushed and its input closes. Do that now and
+                // drain below.
+                break;
+            }
+            match streamer.recv_frame()? {
+                Some(base) => {
+                    if let Some(frame) = queue.pop_front() {
+                let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
+                let tb = tb_for(base_size, sent);
+                let frame_start = std::time::Instant::now();
+                let encoded = match tb {
+                    Some(tb) => {
+                        let (ef, _sw1, _sw2) = encoder.encode_frame_rc(&frame, &base, tb)?;
+                        ef
+                    }
+                    None => encoder.encode_frame_with_base(&frame, &base)?,
+                };
+                process_encoded_frame(
+                    &encoded, &frame, frame_start, &cfg, bit_depth, frames, run_start,
+                    no_psnr, &mut frame_count, &mut total_bytes, &mut total_sse,
+                    &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump,
+                )?;
+                    }
+                }
+                None => break,
+            }
+        }
+        // End of input: flush the encoder (delivering the remaining access
+        // units) and close the decoder's input so its reordered backlog is
+        // emitted, then drain everything.
+        streamer.finish_flush()?;
+        while let Some(base) = streamer.recv_frame()? {
+            if let Some(frame) = queue.pop_front() {
+                let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
+                let tb = tb_for(base_size, sent);
+                let frame_start = std::time::Instant::now();
+                let encoded = match tb {
+                    Some(tb) => {
+                        let (ef, _sw1, _sw2) = encoder.encode_frame_rc(&frame, &base, tb)?;
+                        ef
+                    }
+                    None => encoder.encode_frame_with_base(&frame, &base)?,
+                };
+                process_encoded_frame(
+                    &encoded, &frame, frame_start, &cfg, bit_depth, frames, run_start,
+                    no_psnr, &mut frame_count, &mut total_bytes, &mut total_sse,
+                    &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump,
+                )?;
+            }
+        }
+        streamer.finish()?;
+    } else {
+        let mut read_count = 0u32;
+        loop {
+            if read_count >= frames {
+                break;
+            }
             let frame = match &mut frame_source {
                 FrameSource::Raw(f) => {
                     yuv::read_yuv420_frame_file(&mut **f, width as usize, height as usize, bit_depth)?
@@ -573,117 +745,18 @@ fn run(args: &[String]) -> Result<(), String> {
                 Some(f) => f,
                 None => break,
             };
+            read_count += 1;
             if verify && verify_frames.len() < 2 {
                 verify_frames.push(frame.clone());
             }
-            read_frames += 1;
-            gop_frames.push(frame);
+            let frame_start = std::time::Instant::now();
+            let encoded = encoder.encode_frame(&frame)?;
+            process_encoded_frame(
+                &encoded, &frame, frame_start, &cfg, bit_depth, frames, run_start,
+                no_psnr, &mut frame_count, &mut total_bytes, &mut total_sse,
+                &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump,
+            )?;
         }
-        if gop_frames.is_empty() {
-            break 'outer;
-        }
-
-        // Sub-GOP pipelining: split this GOP into chunks of sub_gop
-        // frames. Each chunk's vvenc base encode is spawned before the
-        // previous chunk's enhancement is encoded, so the base latency is
-        // hidden even when the base is slower than the enhancement.
-        if base_mode == "vvc" && gop_size > 1 {
-            let mut sub_pending: Vec<lcevc_enc::frame::Picture> = Vec::new();
-            let mut sub_task: Option<std::thread::JoinHandle<Result<Vec<lcevc_enc::frame::Picture>, String>>> = None;
-            let mut first = true;
-            let mut prev_task = base_task.take();
-            for chunk in gop_frames.chunks(sub_gop) {
-                // Spawn this chunk's base encode.
-                let cfg2 = cfg.clone();
-                let depth2 = depth;
-                let gop2 = chunk.to_vec();
-                let base_out_path2 = base_out_path.clone();
-                let new_task = std::thread::spawn(move || {
-                    let mut base_gop: Vec<lcevc_enc::frame::Picture> =
-                        Vec::with_capacity(gop2.len());
-                    for f in &gop2 {
-                        let (bw, bh) = {
-                            let d = cfg2.loq_dimensions();
-                            (d[2].0 as usize, d[2].1 as usize)
-                        };
-                        let mut bp = lcevc_enc::frame::Picture::new(bw, bh, cfg2.chroma);
-                        for p in 0..cfg2.num_planes() {
-                            let l1 = lcevc_enc::upscale::downscale_plane(&f.planes[p], cfg2.scaling_l2, depth2);
-                            let base_t = lcevc_enc::upscale::downscale_plane(&l1, cfg2.scaling_l1, depth2);
-                            bp.planes[p] = base_t;
-                        }
-                        base_gop.push(bp);
-                    }
-                    let base_out_opt = if base_out_path2.is_empty() {
-                        None
-                    } else {
-                        Some(base_out_path2.as_str())
-                    };
-                    lcevc_enc::base::encode_decode_base_gop(&cfg2, &base_gop, base_out_opt)
-                });
-                // Join the previous chunk's base (or the previous GOP's
-                // final chunk) and enhance its frames while this chunk's
-                // base encode runs.
-                if let Some(task) = prev_task.take() {
-                    let decoded = task.join().unwrap()?;
-                    let n = sub_pending.len();
-                    let tb = measure_base(&base_out_path, n).or_else(|| {
-                        target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
-                    });
-                    process_gop(
-                        &sub_pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
-                        frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
-                        &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
-                        &mut recon_dump,
-                    )?;
-                } else if first {
-                    first = false;
-                    prev_task = None;
-                }
-                prev_task = Some(new_task);
-                sub_pending = chunk.to_vec();
-            }
-            // The last chunk's base + the first chunk's pending frame list.
-            if let Some(task) = prev_task.take() {
-                let decoded = task.join().unwrap()?;
-                let n = sub_pending.len();
-                let tb = measure_base(&base_out_path, n).or_else(|| {
-                    target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
-                });
-                process_gop(
-                    &sub_pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
-                    frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
-                    &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
-                    &mut recon_dump,
-                )?;
-            }
-            pending = Vec::new();
-        } else {
-            for f in &gop_frames {
-                let frame_start = std::time::Instant::now();
-                let encoded = encoder.encode_frame(f)?;
-                process_encoded_frame(
-                    &encoded, f, frame_start, &cfg, bit_depth, frames, run_start,
-                    no_psnr, &mut frame_count, &mut total_bytes, &mut total_sse,
-                    &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump,
-                )?;
-            }
-        }
-    }
-
-    // Finish the last GOP's base task.
-    if let Some(task) = base_task.take() {
-        let decoded = task.join().unwrap()?;
-        let n = pending.len();
-        let tb = measure_base(&base_out_path, n).or_else(|| {
-            target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
-        });
-        process_gop(
-            &pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
-            frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
-            &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
-            &mut recon_dump,
-        )?;
     }
 
     let psnr = if no_psnr || total_sse == 0 {

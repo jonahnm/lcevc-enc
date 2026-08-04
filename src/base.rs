@@ -18,6 +18,8 @@ use crate::config::LcevcConfig;
 use crate::frame::Picture;
 
 pub mod vvc;
+pub mod vvenc_lib;
+pub use vvc::VvcStreamer;
 
 /// Global base codec selection (set by the CLI).
 pub enum BaseMode {
