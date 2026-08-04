@@ -872,22 +872,19 @@ impl Encoder {
             return Ok((frame, sw1, sw2));
         }
 
-        // 3. Short binary search on the interval spanned by the two tries.
-        let mut lo = self.rc_prev_sw1.min(sw1);
-        let mut hi = self.rc_prev_sw1.max(sw1);
-        for _ in 0..5 {
-            let mid = (lo + hi) / 2;
-            if mid <= lo || mid + 1 >= hi {
+        // 3. Two-step interpolation refinement (size ~ C/sw^2), which
+        //    usually lands within the target in 2-3 encodes total.
+        let mut sw1 = sw1;
+        let mut sw2 = sw2;
+        for _ in 0..2 {
+            let (f, s) = try_sw(self, sw1, sw2)?;
+            consider(&mut best, f, sw1, sw2, s);
+            if (s as f64 / t - 1.0).abs() <= 0.15 {
                 break;
             }
-            let sw2 = (mid / 4).max(1);
-            let (f, s) = try_sw(self, mid, sw2)?;
-            consider(&mut best, f, mid, sw2, s);
-            if fits(s) {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
+            let k = (s as f64 / t).powf(0.5).clamp(0.5, 2.0);
+            sw1 = ((sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
+            sw2 = ((sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
         }
 
         let (frame, sw1, sw2, _) = best.unwrap();
