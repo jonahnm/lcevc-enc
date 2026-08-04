@@ -346,7 +346,8 @@ impl Compiler {
     /// define (and its ISA flag) only to the matching per-directory
     /// sources, so mirror that per file.
     fn simd_for(&self, src: &Path, arch: Arch) -> (Vec<String>, Vec<String>) {
-        let s = src.to_string_lossy();
+        // Normalise separators: Windows paths use backslashes.
+        let s = src.to_string_lossy().replace('\\', "/");
         let (mut defs, mut flags): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         match arch {
             Arch::X86 => {
