@@ -172,6 +172,20 @@ if [ -z "$TOTAL" ] && [ -z "$TARGET" ]; then
     fi
 fi
 
+# Carry the source colour metadata (HDR) into the base VUI and the
+# output MP4's colr box.
+COLOR_ARGS=()
+CP="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=color_primaries -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
+CT="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
+CS="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=colorspace -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
+if [ -n "$CP$CT$CS" ]; then
+    CP="${CP:-bt709}"; CT="${CT:-bt709}"; CS="${CS:-bt709}"
+    [ "$CP" = "unknown" ] && CP="bt709"
+    [ "$CT" = "unknown" ] && CT="bt709"
+    [ "$CS" = "unknown" ] && CS="bt709"
+    COLOR_ARGS+=(--color "$CP:$CT:$CS")
+fi
+
 GOP_ARGS=()
 if [ -n "$GOP" ]; then
     GOP_ARGS+=(--base-gop "$GOP")
@@ -207,6 +221,7 @@ set -o pipefail
         "${FRAMES_ARG[@]}" \
         "${GOP_ARGS[@]}" \
         "${TARGET_ARGS[@]}" \
+        "${COLOR_ARGS[@]}" \
         --base-out "${OUT}.base.266" -o "${OUT}.lcevc" \
         --mux "${OUT}.mp4" \
         "${ENCODE_ARGS[@]}"

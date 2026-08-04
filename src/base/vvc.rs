@@ -206,16 +206,24 @@ pub fn encode_decode_vvc(cfg: &LcevcConfig, base: &Picture, base_out: Option<&st
     let pix_fmt = "yuv420p10le";
     let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let run_ffmpeg = |params: &str, log: &mut String| -> Result<bool, String> {
-        let output = Command::new("ffmpeg")
-            .args([
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
                 "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "rawvideo", "-pix_fmt", pix_fmt,
                 "-s", &format!("{width}x{height}"),
                 "-i", base_yuv.to_str().unwrap(),
                 "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
                 "-vvenc-params", params,
-                base_vvc.to_str().unwrap(),
-            ])
+            ]);
+        if let Some(c) = cfg.colour.as_ref() {
+            cmd.args([
+                "-color_primaries", &c.primaries_name,
+                "-color_trc", &c.transfer_name,
+                "-colorspace", &c.matrix_name,
+            ]);
+        }
+        cmd.arg(base_vvc.to_str().unwrap());
+        let output = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

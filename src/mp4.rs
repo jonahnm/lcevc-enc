@@ -224,7 +224,17 @@ fn dref_box() -> Vec<u8> {
     box_be(b"dinf", &dref)
 }
 
-fn stsd_box_vvc(width: u16, height: u16) -> Vec<u8> {
+fn colr_box(colour: &crate::config::ColourInfo) -> Vec<u8> {
+    let mut p = Vec::new();
+    p.extend_from_slice(b"nclx");
+    p.extend_from_slice(&u16_be(colour.primaries));
+    p.extend_from_slice(&u16_be(colour.transfer));
+    p.extend_from_slice(&u16_be(colour.matrix));
+    p.push(if colour.full_range { 0x80 } else { 0 });
+    box_be(b"colr", &p)
+}
+
+fn stsd_box_vvc(width: u16, height: u16, colour: Option<&crate::config::ColourInfo>) -> Vec<u8> {
     let mut entry = Vec::new();
     entry.extend_from_slice(b"vvc1");
     entry.extend_from_slice(&visual_sample_entry_head());
@@ -237,6 +247,9 @@ fn stsd_box_vvc(width: u16, height: u16) -> Vec<u8> {
     vvcc.extend_from_slice(b"vvcC");
     vvcc.extend_from_slice(&[0, 0, 0, 0]);
     entry.extend_from_slice(&vvcc);
+    if let Some(c) = colour {
+        entry.extend_from_slice(&colr_box(c));
+    }
     entry.extend_from_slice(&btrt_box(15, 0x6992aa, 0x6992aa));
     let mut stsd = Vec::new();
     stsd.extend_from_slice(&[0, 0, 0, 0]);
@@ -350,6 +363,7 @@ pub fn mux_mp4(
     width: u16,
     height: u16,
     fps: u32,
+    colour: Option<&crate::config::ColourInfo>,
 ) -> Result<(), String> {
     let n = base_aus.len().min(enh_nals.len());
     if n == 0 {
@@ -406,7 +420,7 @@ pub fn mux_mp4(
     let base_off_abs: Vec<u32> = base_off.iter().map(|o| mdat_start + o).collect();
     let enh_off_abs: Vec<u32> = enh_off.iter().map(|o| mdat_start + o).collect();
 
-    let mut vvc_stsd = stsd_box_vvc(width, height);
+    let mut vvc_stsd = stsd_box_vvc(width, height, colour);
     let mut lcevc_stsd = stsd_box_lcevc(width, height);
 
     let mut trak_vvc = Vec::new();

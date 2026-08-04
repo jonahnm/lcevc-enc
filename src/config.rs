@@ -206,6 +206,21 @@ pub enum QuantMatrixMode {
     CustomBothUnique,
 }
 
+/// Colour metadata carried from the source into the VVC base VUI and the
+/// MP4 `colr` box. The name fields are the ffmpeg option names (e.g.
+/// "bt2020", "smpte2084", "bt2020nc"); the numeric fields are the
+/// CICP values used by the MP4 nclx box.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ColourInfo {
+    pub primaries_name: String,
+    pub transfer_name: String,
+    pub matrix_name: String,
+    pub primaries: u16,
+    pub transfer: u16,
+    pub matrix: u16,
+    pub full_range: bool,
+}
+
 /// The full encoder configuration, held constant for the stream.
 #[derive(Clone, Debug)]
 pub struct LcevcConfig {
@@ -233,6 +248,7 @@ pub struct LcevcConfig {
     pub temporal_step_width_modifier: u8,
     pub chroma_step_width_multiplier: u8,
     pub user_data: u8, // 0 = disabled, 1 = 2 bits, 2 = 6 bits
+    pub colour: Option<ColourInfo>,
     pub loq1_use_enhanced_depth: bool,
     pub level1_filtering_signalled: bool,
     pub level1_filtering_first_coefficient: u8, // signalled value (0..15)
@@ -264,6 +280,7 @@ impl Default for LcevcConfig {
             temporal_step_width_modifier: 48,
             chroma_step_width_multiplier: 64,
             user_data: 0,
+            colour: None,
             loq1_use_enhanced_depth: false,
             level1_filtering_signalled: false,
             level1_filtering_first_coefficient: 0,

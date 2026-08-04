@@ -182,6 +182,27 @@ if not defined TOTAL if not defined TARGET (
     if defined TOTAL if !TOTAL! GTR 30000 set "TOTAL=30000"
     del /q "%TEMP%\lcevc_w.txt" "%TEMP%\lcevc_h.txt" 2>nul
 )
+rem Carry the source colour metadata (HDR) into the base VUI and the
+rem output MP4's colr box.
+set "COLOR_ARGS="
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=color_primaries -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_cp.txt" 2>nul
+set "CP="
+if exist "%TEMP%\lcevc_cp.txt" set /p CP=<"%TEMP%\lcevc_cp.txt"
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=color_transfer -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_ct.txt" 2>nul
+set "CT="
+if exist "%TEMP%\lcevc_ct.txt" set /p CT=<"%TEMP%\lcevc_ct.txt"
+"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=colorspace -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_cs.txt" 2>nul
+set "CS="
+if exist "%TEMP%\lcevc_cs.txt" set /p CS=<"%TEMP%\lcevc_cs.txt"
+if defined CP set "CP=!CP!"
+if not defined CP set "CP=bt709"
+if not defined CT set "CT=bt709"
+if not defined CS set "CS=bt709"
+if "!CP!"=="unknown" set "CP=bt709"
+if "!CT!"=="unknown" set "CT=bt709"
+if "!CS!"=="unknown" set "CS=bt709"
+set "COLOR_ARGS=--color !CP!:!CT!:!CS!"
+del /q "%TEMP%\lcevc_cp.txt" "%TEMP%\lcevc_ct.txt" "%TEMP%\lcevc_cs.txt" 2>nul
 set "TARGET_ARGS="
 if defined TOTAL set "TARGET_ARGS=--total-kbps !TOTAL!"
 if not defined TOTAL if defined TARGET set "TARGET_ARGS=--target-kbps !TARGET!" 
@@ -189,7 +210,7 @@ set "GOP_ARGS="
 if defined GOP set "GOP_ARGS=--base-gop !GOP!"
 if not defined GOP if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAME!"
 
-"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 512 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
+"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 512 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! !COLOR_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
 if errorlevel 1 (
     echo !! encode failed 1>&2
     exit /b 1

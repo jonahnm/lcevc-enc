@@ -228,6 +228,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut verify = false;
     let mut no_psnr = false;
     let mut no_rdoq = false;
+    let mut colour: Option<lcevc_enc::config::ColourInfo> = None;
     let mut dump_base = false;
     let mut dump_recon = false;
     let mut bit_depth = 8u8;
@@ -322,6 +323,26 @@ fn run(args: &[String]) -> Result<(), String> {
             "--verify" => verify = true,
             "--no-psnr" => no_psnr = true,
             "--no-rdoq" => no_rdoq = true,
+            "--color" => {
+                let spec = next(&mut i)?;
+                let parts: Vec<&str> = spec.split(':').collect();
+                if parts.len() < 3 {
+                    return Err("--color expects CP:TC:MC (e.g. bt2020:smpte2084:bt2020nc)".into());
+                }
+                let (primaries, pn) = colour_primaries(parts[0]);
+                let (transfer, tn) = colour_transfer(parts[1]);
+                let (matrix, mn) = colour_matrix(parts[2]);
+                let full = parts.get(3).map(|r| *r == "pc").unwrap_or(false);
+                colour = Some(lcevc_enc::config::ColourInfo {
+                    primaries_name: pn.to_string(),
+                    transfer_name: tn.to_string(),
+                    matrix_name: mn.to_string(),
+                    primaries,
+                    transfer,
+                    matrix,
+                    full_range: full,
+                });
+            }
             "--dump-base" => dump_base = true,
             "--dump-recon" => dump_recon = true,
             _ => return Err(format!("unknown option {a}\n{}", usage())),
@@ -342,6 +363,7 @@ fn run(args: &[String]) -> Result<(), String> {
             height: height as u16,
             base_depth: bit_depth,
             enhancement_depth: bit_depth,
+            colour: colour.clone(),
             ..Default::default()
         };
         cfg.validate()?;
@@ -362,7 +384,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let d = cfg.loq_dimensions();
             (d[2].0, d[2].1)
         };
-        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps)?;
+        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps, colour.as_ref())?;
         eprintln!("muxed {mux_path} ({} frames, base {bw}x{bh})", base_aus.len());
         return Ok(());
     }
@@ -459,6 +481,7 @@ fn run(args: &[String]) -> Result<(), String> {
         tile_dimensions: tiles,
         custom_tile_size: custom_tile,
         tile_size_compression,
+        colour: colour.clone(),
         ..Default::default()
     };
     cfg.level = lcevc_enc::config::level_for_sample_rate(width, height, fps);
@@ -676,7 +699,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let d = cfg.loq_dimensions();
             (d[2].0, d[2].1)
         };
-        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps)?;
+        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps, colour.as_ref())?;
         eprintln!("muxed {mux_path} ({} frames, base {bw}x{bh})", base_aus.len());
     }
 
@@ -739,6 +762,43 @@ fn run(args: &[String]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn colour_primaries(name: &str) -> (u16, &'static str) {
+    match name {
+        "bt709" => (1, "bt709"),
+        "bt470bg" => (5, "bt470bg"),
+        "smpte170m" => (6, "smpte170m"),
+        "smpte240m" => (7, "smpte240m"),
+        "film" => (8, "film"),
+        "bt2020" => (9, "bt2020"),
+        _ => (2, "bt709"),
+    }
+}
+
+fn colour_transfer(name: &str) -> (u16, &'static str) {
+    match name {
+        "bt709" => (1, "bt709"),
+        "bt470bg" | "gamma22" => (4, "bt470bg"),
+        "smpte170m" => (6, "smpte170m"),
+        "linear" => (8, "linear"),
+        "bt2020_10" => (14, "bt2020_10"),
+        "smpte2084" => (16, "smpte2084"),
+        "arib-std-b67" => (18, "arib-std-b67"),
+        _ => (2, "bt709"),
+    }
+}
+
+fn colour_matrix(name: &str) -> (u16, &'static str) {
+    match name {
+        "gbr" | "rgb" => (0, "gbr"),
+        "bt709" => (1, "bt709"),
+        "bt470bg" => (5, "bt470bg"),
+        "smpte170m" => (6, "smpte170m"),
+        "bt2020nc" => (9, "bt2020nc"),
+        "bt2020c" => (10, "bt2020c"),
+        _ => (2, "bt709"),
+    }
 }
 
 fn parse_scaling(s: &str) -> Result<ScalingMode, String> {
