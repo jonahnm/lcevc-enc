@@ -70,6 +70,10 @@ fn main() {
             }
         }
     }
+    if !failed && objs.len() < 60 {
+        eprintln!("build.rs: vvenc produced only {} objects; treating as failure", objs.len());
+        failed = true;
+    }
     if failed {
         eprintln!("build.rs: vvenc static build failed; using runtime libvvenc instead");
         return;
@@ -232,8 +236,53 @@ enum CompilerKind {
 }
 
 impl Compiler {
+    /// Architecture defines and flags: the vvenc build applies the SIMD
+    /// define (and its ISA flag) only to the matching per-directory
+    /// sources, so mirror that per file.
+    fn simd_for(&self, src: &Path, arch: Arch) -> (Vec<String>, Vec<String>) {
+        let s = src.to_string_lossy();
+        let (mut defs, mut flags): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        match arch {
+            Arch::X86 => {
+                if s.contains("/sse41/") {
+                    defs.push("USE_SSE41".into());
+                    if matches!(self.kind, CompilerKind::Gnu) {
+                        flags.push("-msse4.1".into());
+                    }
+                } else if s.contains("/sse42/") {
+                    defs.push("USE_SSE42".into());
+                    if matches!(self.kind, CompilerKind::Gnu) {
+                        flags.push("-msse4.2".into());
+                    }
+                } else if s.contains("/avx/") {
+                    defs.push("USE_AVX".into());
+                    if matches!(self.kind, CompilerKind::Msvc) {
+                        flags.push("/arch:AVX".into());
+                    } else {
+                        flags.push("-mavx".into());
+                    }
+                } else if s.contains("/avx2/") {
+                    defs.push("USE_AVX2".into());
+                    if matches!(self.kind, CompilerKind::Msvc) {
+                        flags.push("/arch:AVX2".into());
+                    } else {
+                        flags.push("-mavx2".into());
+                    }
+                }
+            }
+            Arch::Arm => {
+                if s.contains("/neon/") {
+                    defs.push("USE_NEON".into());
+                }
+            }
+            Arch::None => {}
+        }
+        (defs, flags)
+    }
+
     fn command(&self, src: &Path, obj: &Path, inc: &[PathBuf], arch: Arch) -> Command {
         let mut cmd = Command::new(&self.cxx);
+        let (defs, flags) = self.simd_for(src, arch);
         match self.kind {
             CompilerKind::Msvc => {
                 cmd.arg("/nologo").arg("/c").arg("/O2").arg("/MD");
@@ -243,14 +292,11 @@ impl Compiler {
                 for i in inc {
                     cmd.arg(format!("/I{}", i.display()));
                 }
-                match arch {
-                    Arch::X86 => {
-                        cmd.arg("/DUSE_SSE41").arg("/DUSE_SSE42").arg("/DUSE_AVX").arg("/DUSE_AVX2");
-                    }
-                    Arch::Arm => {
-                        cmd.arg("/DUSE_NEON");
-                    }
-                    Arch::None => {}
+                for d in &defs {
+                    cmd.arg(format!("/D{d}"));
+                }
+                for f in &flags {
+                    cmd.arg(f);
                 }
                 cmd.arg(src);
             }
@@ -260,14 +306,11 @@ impl Compiler {
                 for i in inc {
                     cmd.arg(format!("-I{}", i.display()));
                 }
-                match arch {
-                    Arch::X86 => {
-                        cmd.arg("-DUSE_SSE41").arg("-DUSE_SSE42").arg("-DUSE_AVX").arg("-DUSE_AVX2");
-                    }
-                    Arch::Arm => {
-                        cmd.arg("-DUSE_NEON");
-                    }
-                    Arch::None => {}
+                for d in &defs {
+                    cmd.arg(format!("-D{d}"));
+                }
+                for f in &flags {
+                    cmd.arg(f);
                 }
                 cmd.arg("-o").arg(obj).arg(src);
             }
@@ -371,7 +414,8 @@ fn msvc_vswhere() -> Option<(PathBuf, Vec<(String, String)>)> {
             "-requires",
             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
             "-find",
-            r"VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe",
+            // HostX64 vs Hostx64 casing varies; use a wildcard.
+            r"VC\Tools\MSVC\**\bin\Host*\x64\cl.exe",
         ])
         .output()
         .ok()?;

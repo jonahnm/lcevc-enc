@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 
 const VVENC_CONFIG_SIZE: usize = 47312;
+const VVENC_VERSION: &str = "1.14.0";
 const VVENC_FASTER: i32 = 0;
 
 // ---------------------------------------------------------------------------
@@ -465,6 +466,11 @@ impl VvencLib {
         if rc != 0 {
             return Err(format!("vvenc_encoder_open failed: {rc}"));
         }
+
+        #[cfg(have_vvenc)]
+        eprintln!("vvenc: using statically linked vvenc {VVENC_VERSION}");
+        #[cfg(not(have_vvenc))]
+        eprintln!("vvenc: using runtime-loaded library");
 
         // Payload buffer large enough for any coded AU at these dimensions.
         let payload_cap = width * height * 2;
