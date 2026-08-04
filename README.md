@@ -35,6 +35,26 @@ against the **actual reference decoder** (lcevcdec 4.2.0,
 cargo build --release
 ```
 
+## Transcoding any input (ffmpeg pipe)
+
+Decodes any ffmpeg-readable input, pipes it through `yuv4mpegpipe`
+(8-bit or 10-bit HDR is preserved), encodes with a VVC base at QP 24
+(half-res pyramid, modified-cubic upsampler, temporal prediction, RDOQ)
+and muxes a dual-track MP4:
+
+```sh
+# Linux/macOS:
+./transcode_lcevc.sh input.mkv out --target-kbps 8000 --audio
+
+# Windows:
+transcode_lcevc.bat input.mkv out --target-kbps 8000 --audio
+```
+
+`--target-kbps N` rate-controls the enhancement layer toward N kbps;
+without it the fixed step widths 1024/256 are used. Produces
+`out.mp4` (VVC base + LCEVC enhancement), `out.lcevc` and `out.base.266`.
+`--audio` remuxes the source audio into the MP4 (stream copy).
+
 ## Usage
 
 ```sh

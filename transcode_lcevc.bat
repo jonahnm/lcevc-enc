@@ -1,0 +1,112 @@
+@echo off
+setlocal enabledelayedexpansion
+rem transcode_lcevc.bat - transcode any ffmpeg-readable input to LCEVC + VVC.
+rem
+rem Pipeline:  ffmpeg (decode + scale to even YUV420) -> yuv4mpegpipe ->
+rem            lcevc_enc (VVC base @ QP 24 + LCEVC enhancement) -> MP4 mux
+rem
+rem usage:
+rem   transcode_lcevc.bat INPUT [OUTPUT_BASE] [--target-kbps N] [--audio] [extra lcevc_enc args...]
+rem
+rem Produces:
+rem   OUTPUT_BASE.mp4        dual-track MP4 (VVC base + LCEVC enhancement)
+rem   OUTPUT_BASE.lcevc      raw LCEVC enhancement stream
+rem   OUTPUT_BASE.base.266   raw VVC base bitstream
+rem
+rem Options:
+rem   --target-kbps N    rate-control the enhancement toward N kbps
+rem   --audio            remux the source audio into the output MP4
+rem                      (stream copy, no re-encode)
+rem   anything else      passed through to lcevc_enc (e.g. --frames N)
+rem
+rem Environment:
+rem   LCEVC_ENC   path to the lcevc_enc.exe binary
+rem   FFMPEG      ffmpeg binary
+rem   FFPROBE     ffprobe binary
+
+if defined LCEVC_ENC set "LCEVC_ENC=%LCEVC_ENC%"
+if not defined LCEVC_ENC set "LCEVC_ENC=%~dp0target\release\lcevc_enc.exe"
+if not exist "%LCEVC_ENC%" if exist "%~dp0target\release\lcevc_enc" set "LCEVC_ENC=%~dp0target\release\lcevc_enc"
+if not defined FFMPEG set "FFMPEG=ffmpeg"
+if not defined FFPROBE set "FFPROBE=ffprobe"
+
+set "INPUT=%~1"
+if "%INPUT%"=="" goto usage
+shift
+
+set "OUT="
+if not "%~1"=="" (
+    set "A1=%~1"
+    if not "!A1:~0,2!"=="--" (
+        set "OUT=%~1"
+        shift
+    )
+)
+if not defined OUT set "OUT=%~n1"
+
+set "TARGET="
+set "AUDIO=0"
+set "EXTRA="
+:argloop
+if "%~1"=="" goto doneargs
+if "%~1"=="--target-kbps" (
+    set "TARGET=%~2"
+    shift
+    shift
+    goto argloop
+)
+if "%~1"=="--audio" (
+    set "AUDIO=1"
+    shift
+    goto argloop
+)
+set "EXTRA=!EXTRA! %~1"
+shift
+goto argloop
+:doneargs
+
+if not exist "%LCEVC_ENC%" (
+    echo lcevc_enc not found at %LCEVC_ENC% ^(cargo build --release first^) 1>&2
+    exit /b 1
+)
+
+rem --- detect the source bit depth (10-bit HDR keeps 10 bits; anything else 8) ---
+set "DEPTH=8"
+set "PIXFMT=yuv420p"
+set "FORMAT=yuv420p"
+set "PF="
+for /f "delims=" %%i in ('"%FFPROBE%" -v error -select_streams v:0 -show_entries stream=pix_fmt -of csv=p=0 "%INPUT%" 2^>nul') do set "PF=%%i"
+echo %PF% | findstr /r "10 12 16" >nul && (
+    set "DEPTH=10"
+    set "PIXFMT=yuv420p10le"
+    set "FORMAT=yuv420p10le"
+)
+
+echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid^)
+
+set "TARGET_ARGS="
+if defined TARGET set "TARGET_ARGS=--target-kbps !TARGET!"
+
+"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2:flags=lanczos,format=!FORMAT!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --temporal on --temporal-sw-modifier 24 --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 256 !TARGET_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
+if errorlevel 1 (
+    echo !! encode failed 1>&2
+    exit /b 1
+)
+
+if "!AUDIO!"=="1" (
+    "%FFMPEG%" -hide_banner -loglevel error -i "%OUT%.mp4" -i "%INPUT%" -map 0:v -map 1:a? -c copy -y "%OUT%.audio.mp4" 2>nul
+    if not errorlevel 1 (
+        move /y "%OUT%.audio.mp4" "%OUT%.mp4" >nul
+        echo == audio copied into %OUT%.mp4
+    ) else (
+        echo !! audio remux failed, keeping video-only %OUT%.mp4 1>&2
+        del /q "%OUT%.audio.mp4" 2>nul
+    )
+)
+
+echo == done: %OUT%.mp4 ^(%OUT%.lcevc + %OUT%.base.266^)
+exit /b 0
+
+:usage
+echo usage: transcode_lcevc.bat INPUT [OUTPUT_BASE] [--target-kbps N] [--audio] [extra args...]
+exit /b 2
