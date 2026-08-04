@@ -1,0 +1,20 @@
+[package]
+name = "lcevc-enc"
+version = "0.1.0"
+edition = "2021"
+description = "LCEVC (ISO/IEC 23094-2) enhancement-layer encoder with a VVC base codec"
+license = "MIT"
+
+[lib]
+name = "lcevc_enc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lcevc_enc"
+path = "src/bin/lcevc_enc.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+debug = true

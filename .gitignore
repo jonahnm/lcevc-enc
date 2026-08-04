@@ -1,0 +1,9 @@
+/target
+/spec.pdf
+/spec.md
+/spec-full.md
+/verify/lcevc_verify
+*.yuv
+*.266
+*.lcevc
+*.mp4
