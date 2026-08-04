@@ -539,20 +539,11 @@ fn run(args: &[String]) -> Result<(), String> {
             break 'outer;
         }
 
-        // Join the previous GOP's base task and enhance its frames.
-        if let Some(task) = base_task.take() {
-            let decoded = task.join().unwrap()?;
-            process_gop(
-                &pending, &decoded, target_kbps, fps, &mut encoder, &cfg, bit_depth,
-                frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
-                &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
-                &mut recon_dump,
-            )?;
-        }
-
+        // Take the previous GOP's base task first, then start THIS GOP's
+        // base encode on a worker thread so it runs while the previous
+        // GOP's enhancement is encoded below (the pipeline's whole point).
+        let prev_task = base_task.take();
         if base_mode == "vvc" && gop_size > 1 {
-            // Start the vvenc base encode of this GOP on a worker thread
-            // (the enhancement of the previous GOP is encoded meanwhile).
             let cfg2 = cfg.clone();
             let depth2 = depth;
             let gop2 = gop_frames.clone();
@@ -582,7 +573,22 @@ fn run(args: &[String]) -> Result<(), String> {
                 };
                 lcevc_enc::base::encode_decode_base_gop(&cfg2, &base_gop, base_out_opt)
             }));
+
+        // Join the previous GOP's base task and enhance its frames while
+        // this GOP's base encode runs.
+        if let Some(task) = prev_task {
+            let decoded = task.join().unwrap()?;
+            let prev_pending = std::mem::replace(&mut pending, gop_frames);
+            process_gop(
+                &prev_pending, &decoded, target_kbps, fps, &mut encoder, &cfg, bit_depth,
+                frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
+                &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
+                &mut recon_dump,
+            )?;
+        } else if base_mode == "vvc" && gop_size > 1 {
             pending = gop_frames;
+        }
+
         } else {
             for f in &gop_frames {
                 let frame_start = std::time::Instant::now();

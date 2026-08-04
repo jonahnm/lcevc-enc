@@ -931,19 +931,17 @@ impl Encoder {
             return Ok((frame, sw1, sw2));
         }
 
-        // 3. Two-step interpolation refinement (size ~ C/sw^2), which
-        //    usually lands within the target in 2-3 encodes total.
-        let mut sw1 = sw1;
-        let mut sw2 = sw2;
-        for _ in 0..2 {
+        // 3. One interpolation refinement (size ~ C/sw^2) and accept
+        //    unconditionally: a re-search is at most two encodes, so the
+        //    per-frame cost stays uniform even when the content changes.
+        let (f, s) = try_sw(self, sw1, sw2)?;
+        consider(&mut best, f, sw1, sw2, s);
+        if (s as f64 / t - 1.0).abs() > 0.1 {
+            let k = (s as f64 / t).powf(0.5).clamp(0.5, 2.0);
+            let sw1 = ((sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
+            let sw2 = ((sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
             let (f, s) = try_sw(self, sw1, sw2)?;
             consider(&mut best, f, sw1, sw2, s);
-            if (s as f64 / t - 1.0).abs() <= 0.15 {
-                break;
-            }
-            let k = (s as f64 / t).powf(0.5).clamp(0.5, 2.0);
-            sw1 = ((sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
-            sw2 = ((sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
         }
 
         let (frame, sw1, sw2, _) = best.unwrap();

@@ -154,6 +154,17 @@ if [ -n "$SCALE" ]; then
     VFILTER="scale=${SCALE}:flags=lanczos,format=${FORMAT}"
 fi
 
+# Default rate-control target: ~0.72 bpp scaled so 4K lands around 6 Mbps
+# (the fixed 1024/256 step widths would otherwise produce a ~10-14 Mbps
+# enhancement at 4K). Pass --target-kbps to override.
+if [ -z "$TARGET" ]; then
+    DW="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
+    DH="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
+    if [ -n "$DW" ] && [ -n "$DH" ] && [ "$DW" -gt 0 ] 2>/dev/null && [ "$DH" -gt 0 ] 2>/dev/null; then
+        TARGET=$(awk -v w="$DW" -v h="$DH" 'BEGIN { t = w*h/8294400*6000; if (t < 800) t = 800; if (t > 30000) t = 30000; printf "%d", t }')
+    fi
+fi
+
 GOP_ARGS=()
 if [ -n "$GOP" ]; then
     GOP_ARGS+=(--base-gop "$GOP")

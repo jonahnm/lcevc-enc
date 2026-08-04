@@ -158,8 +158,23 @@ echo == frames: dur=!DUR! fps=!FPS! fnum=!FNUM! fden=!FDEN! total=!TOTAL_FRAMES!
 
 echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid, !TOTAL_FRAMES! frames^)
 
+rem Default rate-control target: ~0.72 bpp scaled so 4K lands around
+rem 6 Mbps (the fixed 1024/256 step widths would otherwise produce a
+rem ~10-14 Mbps enhancement at 4K). Pass --target-kbps to override.
+if not defined TARGET (
+    set "DW="
+    "%FFPROBE%" -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_w.txt" 2>nul
+    if exist "%TEMP%\lcevc_w.txt" set /p DW=<"%TEMP%\lcevc_w.txt"
+    set "DH="
+    "%FFPROBE%" -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_h.txt" 2>nul
+    if exist "%TEMP%\lcevc_h.txt" set /p DH=<"%TEMP%\lcevc_h.txt"
+    if defined DW if defined DH set /a TARGET=DW*DH/1382 2>nul
+    if defined TARGET if !TARGET! LSS 800 set "TARGET=800"
+    if defined TARGET if !TARGET! GTR 30000 set "TARGET=30000"
+    del /q "%TEMP%\lcevc_w.txt" "%TEMP%\lcevc_h.txt" 2>nul
+)
 set "TARGET_ARGS="
-if defined TARGET set "TARGET_ARGS=--target-kbps !TARGET!"
+if defined TARGET set "TARGET_ARGS=--target-kbps !TARGET!" 
 set "GOP_ARGS="
 if defined GOP set "GOP_ARGS=--base-gop !GOP!"
 if not defined GOP if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAME!"
