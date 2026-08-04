@@ -461,7 +461,7 @@ impl Compiler {
                 // lib.exe lives next to cl.exe.
                 let libexe = self.cxx.with_file_name("lib.exe");
                 let mut cmd = Command::new(libexe);
-                cmd.arg("/nologo").arg("/OUT:").arg(lib);
+                cmd.arg("/nologo").arg(format!("/OUT:{}", lib.display()));
                 cmd.args(objs);
                 for (k, v) in &self.env {
                     cmd.env(k, v);
