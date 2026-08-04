@@ -555,11 +555,7 @@ fn process_plane(
                 // SSE measured in the sample domain to match recon_sse.
                 let base_only_plane = upscale_plane(&l1_pred, cfg.scaling_l2, &kernel, apply_pa)
                     .to_plane(cfg.sample_depth());
-                let mut sse = 0u64;
-                for (a, b) in source.planes[plane].data.iter().zip(base_only_plane.data.iter()) {
-                    let d = (*a as i64 - *b as i64).unsigned_abs();
-                    sse += d * d;
-                }
+                let sse = crate::simd::sse_diff_u16(&source.planes[plane].data, &base_only_plane.data);
                 base_only_sse += sse;
                 base_only.push(base_only_plane);
             }
@@ -994,10 +990,7 @@ impl Encoder {
         if !base_only_planes.is_empty() {
             let mut recon_sse: u64 = 0;
             for p in 0..source.planes.len() {
-                for (a, b) in source.planes[p].data.iter().zip(output.planes[p].data.iter()) {
-                    let d = (*a as i64 - *b as i64).unsigned_abs();
-                    recon_sse += d * d;
-                }
+                recon_sse += crate::simd::sse_diff_u16(&source.planes[p].data, &output.planes[p].data);
             }
             if recon_sse >= base_only_sse {
                 for plane_chunks in &mut residual_chunks {

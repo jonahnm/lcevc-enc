@@ -12,6 +12,7 @@ pub mod entropy;
 pub mod frame;
 pub mod nal;
 pub mod transform;
+pub mod simd;
 pub mod upscale;
 
 pub mod decoder;

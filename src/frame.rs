@@ -91,22 +91,18 @@ impl Plane {
 
     /// Convert to the internal signed fixed-point representation.
     pub fn to_s16(&self, depth: u8) -> PlaneS16 {
-        PlaneS16 {
-            width: self.width,
-            height: self.height,
-            data: self.data.iter().map(|&v| sample_to_s16(v, depth)).collect(),
-        }
+        let mut data = vec![0i16; self.data.len()];
+        crate::simd::samples_to_s16(&self.data, &mut data, depth);
+        PlaneS16 { width: self.width, height: self.height, data }
     }
 }
 
 impl PlaneS16 {
     /// Convert back to samples of the given depth.
     pub fn to_plane(&self, depth: u8) -> Plane {
-        Plane {
-            width: self.width,
-            height: self.height,
-            data: self.data.iter().map(|&v| s16_to_sample(v, depth)).collect(),
-        }
+        let mut data = vec![0u16; self.data.len()];
+        crate::simd::s16_to_samples(&self.data, &mut data, depth);
+        Plane { width: self.width, height: self.height, data }
     }
 }
 
