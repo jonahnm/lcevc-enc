@@ -146,7 +146,7 @@ set "FPS="
 if exist "%TEMP%\lcevc_fps.txt" set /p FPS=<"%TEMP%\lcevc_fps.txt"
 set "FNUM="
 set "FDEN=1"
-if defined FPS for /f "tokens=1,2 delims=/" %%n in ("!FPS!") do set "FNUM=%%n" & set "FDEN=%%m"
+if defined FPS for /f "tokens=1,2 delims=/" %%n in ("!FPS!") do set "FNUM=%%n" & set "FDEN=%%o"
 if defined DUR for /f "delims=." %%a in ("!DUR!") do set "DUR=%%a"
 if not defined TOTAL_FRAMES set /a TOTAL_FRAMES=!DUR!*!FNUM!/!FDEN! 2>nul
 if not defined TOTAL_FRAMES set "TOTAL_FRAMES=0"
