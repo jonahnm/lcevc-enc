@@ -536,6 +536,11 @@ fn run(args: &[String]) -> Result<(), String> {
     // worker thread while the enhancement of GOP N is encoded, hiding most
     // of the base-codec time behind the enhancement work.
     let mut read_frames: u32 = 0;
+    // Sub-GOP pipelining granularity: the base encodes in chunks of this
+    // many frames, each overlapping the previous chunk's enhancement, so
+    // the base's latency is hidden even when it is slower than the
+    // enhancement.
+    let sub_gop = base_gop.min(10).max(1);
     let mut base_task: Option<std::thread::JoinHandle<Result<Vec<lcevc_enc::frame::Picture>, String>>> = None;
     let mut pending: Vec<lcevc_enc::frame::Picture> = Vec::new();
     // Total-bitrate mode: the enhancement budget = the total budget minus
@@ -578,60 +583,81 @@ fn run(args: &[String]) -> Result<(), String> {
             break 'outer;
         }
 
-        // Take the previous GOP's base task first, then start THIS GOP's
-        // base encode on a worker thread so it runs while the previous
-        // GOP's enhancement is encoded below (the pipeline's whole point).
-        let prev_task = base_task.take();
+        // Sub-GOP pipelining: split this GOP into chunks of sub_gop
+        // frames. Each chunk's vvenc base encode is spawned before the
+        // previous chunk's enhancement is encoded, so the base latency is
+        // hidden even when the base is slower than the enhancement.
         if base_mode == "vvc" && gop_size > 1 {
-            let cfg2 = cfg.clone();
-            let depth2 = depth;
-            let gop2 = gop_frames.clone();
-            let base_out_path2 = base_out_path.clone();
-            base_task = Some(std::thread::spawn(move || {
-                // Build the base GOP (downscaled base targets) and run one
-                // vvenc invocation with inter prediction.
-                let mut base_gop: Vec<lcevc_enc::frame::Picture> =
-                    Vec::with_capacity(gop2.len());
-                for f in &gop2 {
-                    let (bw, bh) = {
-                        let d = cfg2.loq_dimensions();
-                        (d[2].0 as usize, d[2].1 as usize)
-                    };
-                    let mut bp = lcevc_enc::frame::Picture::new(bw, bh, cfg2.chroma);
-                    for p in 0..cfg2.num_planes() {
-                        let l1 = lcevc_enc::upscale::downscale_plane(&f.planes[p], cfg2.scaling_l2, depth2);
-                        let base_t = lcevc_enc::upscale::downscale_plane(&l1, cfg2.scaling_l1, depth2);
-                        bp.planes[p] = base_t;
+            let mut sub_pending: Vec<lcevc_enc::frame::Picture> = Vec::new();
+            let mut sub_task: Option<std::thread::JoinHandle<Result<Vec<lcevc_enc::frame::Picture>, String>>> = None;
+            let mut first = true;
+            let mut prev_task = base_task.take();
+            for chunk in gop_frames.chunks(sub_gop) {
+                // Spawn this chunk's base encode.
+                let cfg2 = cfg.clone();
+                let depth2 = depth;
+                let gop2 = chunk.to_vec();
+                let base_out_path2 = base_out_path.clone();
+                let new_task = std::thread::spawn(move || {
+                    let mut base_gop: Vec<lcevc_enc::frame::Picture> =
+                        Vec::with_capacity(gop2.len());
+                    for f in &gop2 {
+                        let (bw, bh) = {
+                            let d = cfg2.loq_dimensions();
+                            (d[2].0 as usize, d[2].1 as usize)
+                        };
+                        let mut bp = lcevc_enc::frame::Picture::new(bw, bh, cfg2.chroma);
+                        for p in 0..cfg2.num_planes() {
+                            let l1 = lcevc_enc::upscale::downscale_plane(&f.planes[p], cfg2.scaling_l2, depth2);
+                            let base_t = lcevc_enc::upscale::downscale_plane(&l1, cfg2.scaling_l1, depth2);
+                            bp.planes[p] = base_t;
+                        }
+                        base_gop.push(bp);
                     }
-                    base_gop.push(bp);
+                    let base_out_opt = if base_out_path2.is_empty() {
+                        None
+                    } else {
+                        Some(base_out_path2.as_str())
+                    };
+                    lcevc_enc::base::encode_decode_base_gop(&cfg2, &base_gop, base_out_opt)
+                });
+                // Join the previous chunk's base (or the previous GOP's
+                // final chunk) and enhance its frames while this chunk's
+                // base encode runs.
+                if let Some(task) = prev_task.take() {
+                    let decoded = task.join().unwrap()?;
+                    let n = sub_pending.len();
+                    let tb = measure_base(&base_out_path, n).or_else(|| {
+                        target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
+                    });
+                    process_gop(
+                        &sub_pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
+                        frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
+                        &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
+                        &mut recon_dump,
+                    )?;
+                } else if first {
+                    first = false;
+                    prev_task = None;
                 }
-                let base_out_opt = if base_out_path2.is_empty() {
-                    None
-                } else {
-                    Some(base_out_path2.as_str())
-                };
-                lcevc_enc::base::encode_decode_base_gop(&cfg2, &base_gop, base_out_opt)
-            }));
-
-        // Join the previous GOP's base task and enhance its frames while
-        // this GOP's base encode runs.
-        if let Some(task) = prev_task {
-            let decoded = task.join().unwrap()?;
-            let n = pending.len();
-            let tb = measure_base(&base_out_path, n).or_else(|| {
-                target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
-            });
-            let prev_pending = std::mem::replace(&mut pending, gop_frames);
-            process_gop(
-                &prev_pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
-                frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
-                &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
-                &mut recon_dump,
-            )?;
-        } else if base_mode == "vvc" && gop_size > 1 {
-            pending = gop_frames;
-        }
-
+                prev_task = Some(new_task);
+                sub_pending = chunk.to_vec();
+            }
+            // The last chunk's base + the first chunk's pending frame list.
+            if let Some(task) = prev_task.take() {
+                let decoded = task.join().unwrap()?;
+                let n = sub_pending.len();
+                let tb = measure_base(&base_out_path, n).or_else(|| {
+                    target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
+                });
+                process_gop(
+                    &sub_pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
+                    frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
+                    &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
+                    &mut recon_dump,
+                )?;
+            }
+            pending = Vec::new();
         } else {
             for f in &gop_frames {
                 let frame_start = std::time::Instant::now();
