@@ -13,7 +13,12 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor/vvenc");
     println!("cargo:rerun-if-env-changed=VVENC_SOURCE");
     println!("cargo:rustc-check-cfg=cfg(have_vvenc)");
-    let status_file = PathBuf::from(env::var("OUT_DIR").unwrap()).join("vvenc-build-status.txt");
+    // Status is written to a findable location (target/vvenc-build.txt)
+    // and mirrored into the build script's OUT_DIR; `cargo:warning`
+    // lines surface it in every build output.
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let status_file = manifest.join("target").join("vvenc-build.txt");
+    let _ = std::fs::create_dir_all(status_file.parent().unwrap());
     let mut status = String::new();
 
     let root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -75,11 +80,22 @@ fn main() {
     for f in &files {
         let obj = objdir.join(format!("{}.o", f.file_stem().unwrap().to_string_lossy()));
         let mut cmd = cc.command(&f, &obj, &inc, arch);
-        let status = cmd.status();
-        match status {
-            Ok(s) if s.success() => objs.push(obj),
-            _ => {
-                eprintln!("build.rs: failed to compile {}", f.display());
+        let out = cmd.output();
+        match out {
+            Ok(o) if o.status.success() => objs.push(obj),
+            Ok(o) => {
+                let err = String::from_utf8_lossy(&o.stderr);
+                let first = err
+                    .lines()
+                    .find(|l| l.contains("error"))
+                    .unwrap_or_else(|| err.lines().next().unwrap_or("no diagnostics"));
+                println!("cargo:warning=vvenc: compile failed for {}", f.display());
+                println!("cargo:warning=vvenc:     {first}");
+                failed = true;
+                break;
+            }
+            Err(e) => {
+                println!("cargo:warning=vvenc: could not run compiler for {}: {e}", f.display());
                 failed = true;
                 break;
             }
@@ -118,8 +134,9 @@ fn main() {
 }
 
 fn finish_status(path: &Path, line: &str) {
-    let _ = std::fs::write(path, format!("{line}
-"));
+    let _ = std::fs::write(path, format!("{line}\n"));
+    // cargo:warning lines are always shown in the build output.
+    println!("cargo:warning=vvenc: {line}");
     eprintln!("build.rs: {line} (see {})", path.display());
 }
 
