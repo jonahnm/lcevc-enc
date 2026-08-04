@@ -19,11 +19,6 @@ pub fn encode_decode_vvc_gop(
         return Ok(Vec::new());
     }
     let depth = cfg.enhancement_depth;
-    let tmp_dir = std::env::temp_dir();
-    let base_yuv = tmp_dir.join(format!("lcevc_gop{depth}.yuv"));
-    let base_vvc = tmp_dir.join(format!("lcevc_gop{depth}.266"));
-    let decoded_yuv = tmp_dir.join(format!("lcevc_gop{depth}_dec.yuv"));
-
     let width = frames[0].width as u32;
     let height = frames[0].height as u32;
     if width % 2 != 0 || height % 2 != 0 {
@@ -32,13 +27,6 @@ pub fn encode_decode_vvc_gop(
     for f in frames {
         if f.width != width as usize || f.height != height as usize {
             return Err("base GOP frames have inconsistent dimensions".into());
-        }
-    }
-
-    {
-        let mut f = std::fs::File::create(&base_yuv).map_err(|e| e.to_string())?;
-        for frame in frames {
-            crate::base::write_yuv420(frame, depth, &mut f).map_err(|e| e.to_string())?;
         }
     }
 
@@ -63,45 +51,57 @@ pub fn encode_decode_vvc_gop(
     // enables wavefront (WPP) + tiles (2 columns x 1 row, resolution
     // dependent; degrades to WPP-only for small bases).
     let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let run_ffmpeg = |params: &str, log: &mut String| -> Result<bool, String> {
-        let output = std::process::Command::new("ffmpeg")
+    let run_ffmpeg = |params: &str, input: &[u8], log: &mut String| -> Result<Option<Vec<u8>>, String> {
+        let mut child = std::process::Command::new("ffmpeg")
             .args([
                 "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "rawvideo", "-pix_fmt", pix_fmt,
                 "-s", &format!("{width}x{height}"),
                 "-r", "25",
-                "-i", base_yuv.to_str().unwrap(),
+                "-i", "-",
                 "-c:v", "libvvenc", "-preset", &preset, "-qp", &qp,
                 "-vvenc-params", params,
-                base_vvc.to_str().unwrap(),
+                "-f", "vvc", "pipe:1",
             ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|e| format!("failed to run ffmpeg (libvvenc gop): {e}"))?;
+        // Write the YUV on a thread so the encode output pipe cannot deadlock.
+        let mut stdin = child.stdin.take().unwrap();
+        let input_owned = input.to_vec();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input_owned);
+        });
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("ffmpeg libvvenc gop failed: {e}"))?;
+        writer.join().unwrap();
         if !output.status.success() {
             *log = String::from_utf8_lossy(&output.stderr).into_owned();
-            Ok(false)
+            Ok(None)
         } else {
-            Ok(true)
+            Ok(Some(output.stdout))
         }
     };
     // mtprofile=3 enables wavefront (WPP) + tiles; older libvvenc builds
     // reject the key, so retry with the basic params in that case.
+    let mut yuv = Vec::with_capacity(frames.len() * (width as usize * height as usize * 3 / 2) * 2);
+    for frame in frames {
+        crate::base::write_yuv420(frame, depth, &mut yuv).map_err(|e| e.to_string())?;
+    }
     let mut ffmpeg_log = String::new();
     let mtp_params = format!(
         "internalbitdepth={}:inputbitdepth={}:threads={}:mtprofile=3",
         depth, depth, ncpu,
     );
     let base_params = format!("internalbitdepth={}:inputbitdepth={}:threads={}", depth, depth, ncpu);
-    let ok = run_ffmpeg(&mtp_params, &mut ffmpeg_log)?
-        || (run_ffmpeg(&base_params, &mut ffmpeg_log)?);
-    if !ok {
-        return Err(format!(
-            "ffmpeg libvvenc gop encode failed:\n{ffmpeg_log}"
-        ));
-    }
+    let vvc = run_ffmpeg(&mtp_params, &yuv, &mut ffmpeg_log)?
+        .or_else(|| run_ffmpeg(&base_params, &yuv, &mut ffmpeg_log).unwrap_or(None))
+        .ok_or_else(|| format!("ffmpeg libvvenc gop encode failed:\n{ffmpeg_log}"))?;
+
     if let Some(path) = base_out {
         use std::io::Write;
         let mut out = std::fs::OpenOptions::new()
@@ -109,27 +109,41 @@ pub fn encode_decode_vvc_gop(
             .append(true)
             .open(path)
             .map_err(|e| format!("failed to open base output: {e}"))?;
-        let data = std::fs::read(&base_vvc).map_err(|e| e.to_string())?;
-        out.write_all(&data).map_err(|e| format!("failed to write base output: {e}"))?;
+        out.write_all(&vvc).map_err(|e| format!("failed to write base output: {e}"))?;
     }
 
-    let status = std::process::Command::new("ffmpeg")
+    // Decode the VVC bitstream back to YUV (piped, no temp files).
+    let mut child = std::process::Command::new("ffmpeg")
         .args([
             "-hide_banner", "-loglevel", "error", "-y",
-            "-i", base_vvc.to_str().unwrap(),
+            "-i", "-",
             "-f", "rawvideo", "-pix_fmt", pix_fmt,
-            decoded_yuv.to_str().unwrap(),
+            "pipe:1",
         ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .map_err(|e| format!("failed to run ffmpeg (vvc gop decode): {e}"))?;
-    if !status.success() {
-        return Err("ffmpeg vvc gop decode failed".into());
-    }
-
-    let data = std::fs::read(&decoded_yuv).map_err(|e| e.to_string())?;
+    let data = {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        let vvc2 = vvc.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&vvc2);
+        });
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("ffmpeg vvc gop decode failed: {e}"))?;
+        writer.join().unwrap();
+        if !output.status.success() {
+            return Err(format!(
+                "ffmpeg vvc gop decode failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        output.stdout
+    };
     let bytes_per = if depth == 10 { 2usize } else { 1usize };
     let n = width as usize * height as usize;
     let frame_bytes = (n + 2 * ((width as usize / 2) * (height as usize / 2))) * bytes_per;
@@ -161,7 +175,6 @@ pub fn encode_decode_vvc_gop(
         }
         out.push(pic);
     }
-    let _ = std::fs::File::create(&base_yuv);
     Ok(out)
 }
 

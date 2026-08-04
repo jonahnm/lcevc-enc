@@ -515,9 +515,11 @@ impl Encoder {
         self.encode_frame_with_base(source, &base_picture)
     }
 
-    /// Rate-controlled encode: binary search the L1 step width (L2 = L1/4,
-    /// clamped) for the finest step width whose payload fits `target_bytes`.
-    /// Payload size is monotone in the step width (coarser = smaller).
+    /// Rate-controlled encode: search the L1/L2 step widths so the payload
+    /// fits `target_bytes`. Most frames reuse the previous frame's step
+    /// widths (content changes slowly), so the typical cost is ONE full
+    /// encode; a size-vs-step interpolation and a short binary search cover
+    /// the rest.
     pub fn encode_frame_rc(
         &mut self,
         source: &Picture,
@@ -536,27 +538,67 @@ impl Encoder {
             enc.stats = stats;
             Ok((frame, size))
         };
+        let fits = |size: usize| size <= target_bytes;
+        // Keep the finest fitting candidate; if none fits, the smallest.
+        let consider = |best: &mut Option<(EncodedFrame, u32, u32, usize)>,
+                        frame: EncodedFrame,
+                        sw1: u32,
+                        sw2: u32,
+                        size: usize| {
+            match best {
+                None => *best = Some((frame, sw1, sw2, size)),
+                Some((_, _, _, bsize)) => {
+                    let bf = fits(*bsize);
+                    let f = fits(size);
+                    if (f && !bf) || (f == bf && ((f && size > *bsize) || (!f && size < *bsize))) {
+                        *best = Some((frame, sw1, sw2, size));
+                    }
+                }
+            }
+        };
 
-        let mut lo = 16u32; // finest possible sw1
-        let mut hi = 16384u32; // coarsest possible sw1
         let mut best: Option<(EncodedFrame, u32, u32, usize)> = None;
-        for _ in 0..8 {
-            let sw1 = (lo + hi) / 2;
-            let sw2 = (sw1 / 4).max(1);
-            let (frame, size) = try_sw(self, sw1, sw2)?;
-            if size <= target_bytes {
-                // fits: remember it, try finer
-                best = Some((frame, sw1, sw2, size));
-                hi = sw1;
-                if sw1 == lo {
-                    break;
-                }
+        let t = target_bytes.max(1) as f64;
+
+        // 1. The previous frame's step widths (typically already right).
+        let (f, s) = try_sw(self, self.rc_prev_sw1, self.rc_prev_sw2)?;
+        consider(&mut best, f, self.rc_prev_sw1, self.rc_prev_sw2, s);
+        if (s as f64 / t - 1.0).abs() <= 0.25 {
+            let (frame, sw1, sw2, _) = best.unwrap();
+            self.rc_prev_sw1 = sw1;
+            self.rc_prev_sw2 = sw2;
+            return Ok((frame, sw1, sw2));
+        }
+
+        // 2. Interpolate: payload size ~ C / sw^2, so sw scales by
+        // (size/target)^0.5.
+        let k = (s as f64 / t).powf(0.5).clamp(0.25, 4.0);
+        let sw1 = ((self.rc_prev_sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
+        let sw2 = ((self.rc_prev_sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
+        let (f, s) = try_sw(self, sw1, sw2)?;
+        consider(&mut best, f, sw1, sw2, s);
+        if (s as f64 / t - 1.0).abs() <= 0.1 {
+            let (frame, sw1, sw2, _) = best.unwrap();
+            self.rc_prev_sw1 = sw1;
+            self.rc_prev_sw2 = sw2;
+            return Ok((frame, sw1, sw2));
+        }
+
+        // 3. Short binary search on the interval spanned by the two tries.
+        let mut lo = self.rc_prev_sw1.min(sw1);
+        let mut hi = self.rc_prev_sw1.max(sw1);
+        for _ in 0..5 {
+            let mid = (lo + hi) / 2;
+            if mid <= lo || mid + 1 >= hi {
+                break;
+            }
+            let sw2 = (mid / 4).max(1);
+            let (f, s) = try_sw(self, mid, sw2)?;
+            consider(&mut best, f, mid, sw2, s);
+            if fits(s) {
+                hi = mid;
             } else {
-                // too big: go coarser
-                lo = sw1;
-                if sw1 + 1 >= hi {
-                    break;
-                }
+                lo = mid;
             }
         }
 
