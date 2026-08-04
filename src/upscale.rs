@@ -111,6 +111,10 @@ unsafe fn upscale_block_2d_avx2(
         let lo = _mm256_srai_epi32::<14>(_mm256_add_epi32(lo, rnd));
         let hi = _mm256_srai_epi32::<14>(_mm256_add_epi32(hi, rnd));
         let p = _mm256_packs_epi32(lo, hi);
+        // shift_round_s15 clamps to the s15 range [-16384, 16383]; packs
+        // only saturates to full i16.
+        let p = _mm256_min_epi16(p, _mm256_set1_epi16(16383));
+        let p = _mm256_max_epi16(p, _mm256_set1_epi16(-16384));
         let out = _mm256_castsi256_si128(p);
         if phase == 0 {
             _mm_storeu_si128(v0.as_mut_ptr() as *mut __m128i, out);
@@ -145,6 +149,10 @@ unsafe fn upscale_block_2d_avx2(
         let odd = _mm256_srai_epi32::<14>(_mm256_add_epi32(odd, rnd));
         let even = _mm256_srai_epi32::<14>(_mm256_add_epi32(even, rnd));
         let p = _mm256_packs_epi32(odd, even);
+        // shift_round_s15 clamps to the s15 range [-16384, 16383]; packs
+        // only saturates to full i16.
+        let p = _mm256_min_epi16(p, _mm256_set1_epi16(16383));
+        let p = _mm256_max_epi16(p, _mm256_set1_epi16(-16384));
         // p low-128 = (odd0..3, even0..3); interleave with itself shifted
         // by 4 lanes to get (odd0,even0,odd1,even1,...)
         let plo = _mm256_castsi256_si128(p);
