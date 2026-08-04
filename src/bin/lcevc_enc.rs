@@ -127,7 +127,7 @@ fn process_encoded_frame(
 fn process_gop(
     gop_frames: &[lcevc_enc::frame::Picture],
     decoded: &[lcevc_enc::frame::Picture],
-    target_kbps: Option<u32>,
+    target_bytes: Option<usize>,
     fps: u32,
     encoder: &mut lcevc_enc::encoder::Encoder,
     cfg: &lcevc_enc::config::LcevcConfig,
@@ -145,11 +145,9 @@ fn process_gop(
 ) -> Result<(), String> {
     for (f, base) in gop_frames.iter().zip(decoded.iter()) {
         let frame_start = std::time::Instant::now();
-        let encoded = match target_kbps {
-            Some(kbps) => {
-                let target_bytes =
-                    ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1);
-                let (ef, _sw1, _sw2) = encoder.encode_frame_rc(f, base, target_bytes)?;
+        let encoded = match target_bytes {
+            Some(tb) => {
+                let (ef, _sw1, _sw2) = encoder.encode_frame_rc(f, base, tb)?;
                 ef
             }
             None => encoder.encode_frame_with_base(f, base)?,
@@ -239,6 +237,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut base_gop = 30usize;
     let mut base_gop_seconds: Option<f64> = None;
     let mut target_kbps: Option<u32> = None;
+    let mut total_kbps: Option<u32> = None;
     let mut qm_beta: f64 = 0.3;
     let mut vvc_preset = "medium".to_string();
     let mut vvc_qp = "30".to_string();
@@ -316,6 +315,7 @@ fn run(args: &[String]) -> Result<(), String> {
             "--base-gop" => base_gop = next(&mut i)?.parse().map_err(|_| "bad base-gop")?,
             "--base-gop-seconds" => base_gop_seconds = Some(next(&mut i)?.parse().map_err(|_| "bad base-gop-seconds")?),
             "--target-kbps" => target_kbps = Some(next(&mut i)?.parse().map_err(|_| "bad target-kbps")?),
+            "--total-kbps" => total_kbps = Some(next(&mut i)?.parse().map_err(|_| "bad total-kbps")?),
             "--qm-beta" => qm_beta = next(&mut i)?.parse().map_err(|_| "bad qm-beta")?,
             "--vvc-preset" => vvc_preset = next(&mut i)?,
             "--vvc-qp" => vvc_qp = next(&mut i)?,
@@ -515,6 +515,22 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut read_frames: u32 = 0;
     let mut base_task: Option<std::thread::JoinHandle<Result<Vec<lcevc_enc::frame::Picture>, String>>> = None;
     let mut pending: Vec<lcevc_enc::frame::Picture> = Vec::new();
+    // Total-bitrate mode: the enhancement budget = the total budget minus
+    // the base codec's measured bitrate (base file growth per GOP).
+    let mut prev_base_size: u64 = 0;
+    let mut measure_base = |base_path: &str, n_frames: usize| -> Option<usize> {
+        let size = std::fs::metadata(base_path).map(|m| m.len()).unwrap_or(0);
+        let delta = size.saturating_sub(prev_base_size);
+        prev_base_size = size;
+        if let Some(total) = total_kbps {
+            if n_frames > 0 {
+                let base_bps = delta * 8 * fps as u64 / n_frames as u64;
+                let budget = (total as u64 * 1000).saturating_sub(base_bps);
+                return Some(((budget / 8) / fps.max(1) as u64).max(1) as usize);
+            }
+        }
+        None
+    };
     'outer: loop {
         // Read one GOP of source frames.
         let mut gop_frames: Vec<lcevc_enc::frame::Picture> = Vec::new();
@@ -578,9 +594,13 @@ fn run(args: &[String]) -> Result<(), String> {
         // this GOP's base encode runs.
         if let Some(task) = prev_task {
             let decoded = task.join().unwrap()?;
+            let n = pending.len();
+            let tb = measure_base(&base_out_path, n).or_else(|| {
+                target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
+            });
             let prev_pending = std::mem::replace(&mut pending, gop_frames);
             process_gop(
-                &prev_pending, &decoded, target_kbps, fps, &mut encoder, &cfg, bit_depth,
+                &prev_pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
                 frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
                 &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
                 &mut recon_dump,
@@ -605,8 +625,12 @@ fn run(args: &[String]) -> Result<(), String> {
     // Finish the last GOP's base task.
     if let Some(task) = base_task.take() {
         let decoded = task.join().unwrap()?;
+        let n = pending.len();
+        let tb = measure_base(&base_out_path, n).or_else(|| {
+            target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
+        });
         process_gop(
-            &pending, &decoded, target_kbps, fps, &mut encoder, &cfg, bit_depth,
+            &pending, &decoded, tb, fps, &mut encoder, &cfg, bit_depth,
             frames, run_start, no_psnr, &mut frame_count, &mut total_bytes,
             &mut total_sse, &mut total_samples, &mut out_file, &mut base_dump,
             &mut recon_dump,

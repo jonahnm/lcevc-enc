@@ -61,6 +61,7 @@ case "$OUT" in
 esac
 
 TARGET=""
+TOTAL=""
 AUDIO=0
 KEYFRAME=""
 GOP=""
@@ -70,6 +71,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --target-kbps)
             TARGET="$2"
+            shift 2
+            ;;
+        --total-kbps)
+            TOTAL="$2"
             shift 2
             ;;
         --audio)
@@ -154,14 +159,16 @@ if [ -n "$SCALE" ]; then
     VFILTER="scale=${SCALE}:flags=lanczos,format=${FORMAT}"
 fi
 
-# Default rate-control target: ~0.72 bpp scaled so 4K lands around 6 Mbps
-# (the fixed 1024/256 step widths would otherwise produce a ~10-14 Mbps
-# enhancement at 4K). Pass --target-kbps to override.
-if [ -z "$TARGET" ]; then
+# Default total-bitrate budget: ~0.6 bpp scaled so 4K caps at 5 Mbps
+# TOTAL (VVC base + enhancement); the encoder measures the base's actual
+# bitrate per GOP and gives the rest to the enhancement. Pass
+# --total-kbps to override, or --target-kbps for an enhancement-only
+# target.
+if [ -z "$TOTAL" ] && [ -z "$TARGET" ]; then
     DW="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
     DH="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
     if [ -n "$DW" ] && [ -n "$DH" ] && [ "$DW" -gt 0 ] 2>/dev/null && [ "$DH" -gt 0 ] 2>/dev/null; then
-        TARGET=$(awk -v w="$DW" -v h="$DH" 'BEGIN { t = w*h/8294400*6000; if (t < 800) t = 800; if (t > 30000) t = 30000; printf "%d", t }')
+        TOTAL=$(awk -v w="$DW" -v h="$DH" 'BEGIN { t = w*h/8294400*5000; if (t < 800) t = 800; if (t > 30000) t = 30000; printf "%d", t }')
     fi
 fi
 
@@ -175,7 +182,11 @@ fi
 echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, half-res pyramid, ${TOTAL_FRAMES:-?} frames) =="
 
 TARGET_ARGS=()
-[ -n "$TARGET" ] && TARGET_ARGS+=(--target-kbps "$TARGET")
+if [ -n "$TOTAL" ]; then
+    TARGET_ARGS+=(--total-kbps "$TOTAL")
+elif [ -n "$TARGET" ]; then
+    TARGET_ARGS+=(--target-kbps "$TARGET")
+fi
 
 set -o pipefail
 "$FFMPEG" -hide_banner -loglevel error \
