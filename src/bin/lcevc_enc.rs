@@ -96,6 +96,8 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut custom_tile = None;
     let mut tile_size_compression = 0u8;
     let mut verify = false;
+    let mut no_psnr = false;
+    let mut no_rdoq = false;
     let mut dump_base = false;
     let mut dump_recon = false;
     let mut bit_depth = 8u8;
@@ -184,6 +186,8 @@ fn run(args: &[String]) -> Result<(), String> {
             "--vvc-preset" => vvc_preset = next(&mut i)?,
             "--vvc-qp" => vvc_qp = next(&mut i)?,
             "--verify" => verify = true,
+            "--no-psnr" => no_psnr = true,
+            "--no-rdoq" => no_rdoq = true,
             "--dump-base" => dump_base = true,
             "--dump-recon" => dump_recon = true,
             _ => return Err(format!("unknown option {a}\n{}", usage())),
@@ -340,6 +344,7 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let mut encoder = Encoder::new(cfg.clone(), sw_l1, sw_l2);
     encoder.qm_beta = qm_beta;
+    encoder.rdoq = !no_rdoq;
 
     let mut frame_count = 0u32;
     let mut total_bytes = 0usize;
@@ -382,22 +387,26 @@ fn run(args: &[String]) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
 
-        let mut frame_sse = 0u64;
-        let mut frame_samples = 0u64;
-        for p in 0..frame.planes.len() {
-            for (a, b) in frame.planes[p].data.iter().zip(encoded.output.planes[p].data.iter()) {
-                let d = *a as i64 - *b as i64;
-                frame_sse += (d * d) as u64;
-                frame_samples += 1;
-            }
-        }
-        *total_sse += frame_sse;
-        *total_samples += frame_samples;
-        let psnr = if frame_sse == 0 {
-            f64::INFINITY
+        let psnr = if no_psnr {
+            f64::NAN
         } else {
-            let max_val = ((1u64 << bit_depth) - 1) as f64;
-            10.0 * (max_val * max_val * frame_samples as f64 / frame_sse as f64).log10()
+            let mut frame_sse = 0u64;
+            let mut frame_samples = 0u64;
+            for p in 0..frame.planes.len() {
+                for (a, b) in frame.planes[p].data.iter().zip(encoded.output.planes[p].data.iter()) {
+                    let d = *a as i64 - *b as i64;
+                    frame_sse += (d * d) as u64;
+                    frame_samples += 1;
+                }
+            }
+            *total_sse += frame_sse;
+            *total_samples += frame_samples;
+            if frame_sse == 0 {
+                f64::INFINITY
+            } else {
+                let max_val = ((1u64 << bit_depth) - 1) as f64;
+                10.0 * (max_val * max_val * frame_samples as f64 / frame_sse as f64).log10()
+            }
         };
 
         let now = std::time::Instant::now();
@@ -412,11 +421,19 @@ fn run(args: &[String]) -> Result<(), String> {
             String::new()
         };
         let frames_total = if frames == u32::MAX { "?".to_string() } else { frames.to_string() };
-        eprintln!(
-            "frame {total_frames}/{}: {frame_secs:6.2} s ({fps:5.2} fps, avg {avg_fps:5.2}){eta}, \
-             enhancement {nal_bytes:>6} bytes, PSNR {psnr:.2} dB",
-            frames_total,
-        );
+        if psnr.is_nan() {
+            eprintln!(
+                "frame {total_frames}/{}: {frame_secs:6.2} s ({fps:5.2} fps, avg {avg_fps:5.2}){eta}, \
+                 enhancement {nal_bytes:>6} bytes",
+                frames_total,
+            );
+        } else {
+            eprintln!(
+                "frame {total_frames}/{}: {frame_secs:6.2} s ({fps:5.2} fps, avg {avg_fps:5.2}){eta}, \
+                 enhancement {nal_bytes:>6} bytes, PSNR {psnr:.2} dB",
+                frames_total,
+            );
+        }
         *frame_count += 1;
         Ok(())
     };
@@ -487,15 +504,19 @@ fn run(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let psnr = if total_sse == 0 {
-        f64::INFINITY
+    let psnr = if no_psnr || total_sse == 0 {
+        f64::NAN
     } else {
         let max_val = ((1u64 << bit_depth) - 1) as f64;
         10.0 * (max_val * max_val * total_samples as f64 / total_sse as f64).log10()
     };
-    eprintln!(
-        "encoded {frame_count} frames -> {out_path} ({total_bytes} bytes), encoder reconstruction PSNR {psnr:.2} dB"
-    );
+    if psnr.is_nan() {
+        eprintln!("encoded {frame_count} frames -> {out_path} ({total_bytes} bytes)");
+    } else {
+        eprintln!(
+            "encoded {frame_count} frames -> {out_path} ({total_bytes} bytes), encoder reconstruction PSNR {psnr:.2} dB"
+        );
+    }
     eprintln!(
         "step widths: L1 = {sw_l1}, L2 = {sw_l2}; transform {:?}; upsampler {:?}; scaling L1 {:?} L2 {:?}",
         cfg.transform, cfg.upsampler, cfg.scaling_l1, cfg.scaling_l2,

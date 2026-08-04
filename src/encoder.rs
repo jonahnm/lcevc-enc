@@ -80,6 +80,8 @@ pub struct Encoder {
 
     /// Content-adaptive quant-matrix exponent (0 = keep the default).
     pub qm_beta: f64,
+    /// Rate-distortion optimized quantization (default on).
+    pub rdoq: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +266,7 @@ fn encode_tu(
     deblock_corner: u8,
     deblock_side: u8,
     energy: &mut [f64],
+    rdoq: bool,
 ) -> (Vec<i16>, Vec<i16>) {
     // Build the residual block in the interleaved layout.
     let n = tu_size * tu_size;
@@ -275,7 +278,7 @@ fn encode_tu(
                 .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
     }
-    encode_tu_residual(&residual, table, forward, signal, deblock, deblock_corner, deblock_side, energy)
+    encode_tu_residual(&residual, table, forward, signal, deblock, deblock_corner, deblock_side, energy, rdoq)
 }
 
 /// Quantize and reconstruct an already-built residual block.
@@ -289,6 +292,7 @@ fn encode_tu_residual(
     deblock_corner: u8,
     deblock_side: u8,
     energy: &mut [f64],
+    rdoq: bool,
 ) -> (Vec<i16>, Vec<i16>) {
     let tu_size = (residual.len() as f64).sqrt() as usize;
     let _ = (deblock, deblock_corner, deblock_side, tu_size);
@@ -314,20 +318,26 @@ fn encode_tu_residual(
     // the pixel SSE of a level change is (dequant(q) - orig)^2 times a
     // constant. Bits are estimated from the coefficient magnitude (1 LSB byte
     // for |q| <= 32, else LSB+MSB); zero also saves the run entropy.
-    if table.layers[signal as usize][0].step_width > 0 {
-        let mut rdq = coeffs.clone();
+    //
+    // The cost is scale-invariant, so it is evaluated exactly in integers:
+    // cost(q) = (dq*denom - num)^2 + (sw^2/16)*bits*denom^2. The squared
+    // error term can reach ~2e25, so u128 accumulates it (no divisions, no
+    // floats in the hot loop).
+    if rdoq && table.layers[signal as usize][0].step_width > 0 {
+        let denom_i = denom as i64;
+        let d2 = (denom_i * denom_i) as u64;
         for l in 0..num_layers {
             let layer = &table.layers[signal as usize][l];
-            let sw = layer.step_width as i32;
-            let off = layer.offset as i32;
-            let q0 = coeffs[l] as i32;
-            let orig = nums[l] as f64 / denom as f64;
-            // Lambda ~ sw^2 tuned empirically (0.125 absorbs the transform
+            let sw = layer.step_width as i64;
+            let off = layer.offset as i64;
+            let q0 = coeffs[l] as i64;
+            let num = nums[l] as i64;
+            // Lambda ~ sw^2 tuned empirically (0.0625 absorbs the transform
             // orthogonality constant); a bit is worth ~ sw/2 of error.
-            let lambda = (sw as f64 * sw as f64) * 0.0625;
+            let lambda_q = (sw * sw) / 16;
             let mut best = q0;
-            let mut best_cost = f64::INFINITY;
-            let candidates: [i32; 3] = [q0 - 1, q0, q0 + 1];
+            let mut best_cost = u128::MAX;
+            let candidates: [i64; 3] = [q0 - 1, q0, q0 + 1];
             for &c in &candidates {
                 let dq = if c > 0 {
                     c * sw + off
@@ -336,13 +346,20 @@ fn encode_tu_residual(
                 } else {
                     0
                 };
-                let err = dq as f64 - orig;
+                let e = dq * denom_i - num;
+                // The square of a 2's-complement value is exact under the
+                // u64 reinterpretation; u64 x u64 -> u128 is a single mulq.
+                let eu = e as u64;
+                let e2 = (eu as u128) * (eu as u128);
                 let bits = if c == 0 {
-                    0.0
+                    0u64
+                } else if c.unsigned_abs() <= 32 {
+                    9
                 } else {
-                    (if c.unsigned_abs() <= 32 { 8.0 } else { 16.0 }) + 1.0
+                    17
                 };
-                let cost = err * err + lambda * bits;
+                let bt = ((lambda_q as u64) * bits) as u128 * (d2 as u128);
+                let cost = e2 + bt;
                 if cost < best_cost {
                     best_cost = cost;
                     best = c;
@@ -350,14 +367,14 @@ fn encode_tu_residual(
             }
             // Also consider full zeroing for small levels (cheap to check).
             if q0.unsigned_abs() <= 2 {
-                let cost = orig * orig;
+                let nu = num as u64;
+                let cost = (nu as u128) * (nu as u128);
                 if cost < best_cost {
                     best = 0;
                 }
             }
-            rdq[l] = best.clamp(-8192, 8191) as i16;
+            coeffs[l] = best.clamp(-8192, 8191) as i16;
         }
-        coeffs = rdq;
     }
 
     // Reconstruct: dequant (mirror) then inverse transform.
@@ -472,6 +489,7 @@ impl Encoder {
             rc_prev_sw1: step_width_l1,
             rc_prev_sw2: step_width_l2,
             qm_beta: 0.3,
+            rdoq: true,
         }
     }
 
@@ -597,6 +615,7 @@ impl Encoder {
         let mut base_only_sse: u64 = 0;
 
         let tu_order = cfg.temporal_enabled || cfg.is_tiled();
+        let rdoq = self.rdoq;
         let mut frame_energy = [[0.0f64; 16]; 2];
         // Snapshot the temporal buffer: on a dropped frame the decoder leaves
         // it untouched, so the encoder must too.
@@ -633,7 +652,7 @@ impl Encoder {
                         TemporalSignal::Inter, deblock,
                         cfg.level1_filtering_first_coefficient,
                         cfg.level1_filtering_second_coefficient,
-                        &mut energy_l1,
+                        &mut energy_l1, rdoq,
                     );
                     commit_residual(&mut l1_recon, x, y, tu_size, &residual);
                     for l in 0..num_layers {
@@ -705,7 +724,7 @@ impl Encoder {
                         }
                         let (c_inter, r_inter) = encode_tu_residual(
                             &residual, &table_inter, &forward0,
-                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2);
+                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
                         let mut sse_inter = 0i64;
                         for yy in 0..tu_size {
                             for xx in 0..tu_size {
@@ -719,7 +738,7 @@ impl Encoder {
                         }
                         let (c_intra, r_intra) = encode_tu(
                             &src_s16, &l2_pred, &table_intra, &forward0, tu_size, x, y,
-                            TemporalSignal::Intra, false, 0, 0, &mut energy_l2);
+                            TemporalSignal::Intra, false, 0, 0, &mut energy_l2, rdoq);
                         let sse_intra = block_sse(&l2_pred, x, y, tu_size, &r_intra, &src_s16);
                         if sse_inter <= sse_intra as i64 {
                             add_block(&mut tb, x, y, tu_size, &r_inter);
@@ -735,7 +754,7 @@ impl Encoder {
                         // the decoder always "sets" the temporal buffer.
                         let (coeffs, residual) = encode_tu(
                             &src_s16, &l2_pred, &table_inter, &forward0, tu_size, x, y,
-                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2);
+                            TemporalSignal::Inter, false, 0, 0, &mut energy_l2, rdoq);
                         commit_residual(&mut l2_recon, x, y, tu_size, &residual);
                         if temporal_enabled {
                             set_block(&mut tb, x, y, tu_size, &residual);

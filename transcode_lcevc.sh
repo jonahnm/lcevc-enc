@@ -18,7 +18,13 @@
 #   --audio            remux the source audio into the output MP4 (needs
 #                      the system ffmpeg; uses stream copy, no re-encode)
 #   anything else      passed through to lcevc_enc (e.g. --frames N,
-#                      --scaling-l1 2 for a quarter-res base)
+#                      --temporal on --temporal-sw-modifier 24 for temporal
+#                      prediction, --scaling-l1 2 for a quarter-res base)
+#
+# The VVC base is encoded per GOP (--base-gop 30, one vvenc invocation per
+# group for inter prediction). Temporal prediction is off by default; it
+# costs ~50% encode time for ~+0.1 dB and can be enabled by passing
+# --temporal on --temporal-sw-modifier 24 as extra args.
 #
 # Environment:
 #   LCEVC_ENC   path to the lcevc_enc binary (default: target/release)
@@ -95,9 +101,9 @@ set -o pipefail
         --base-gop 30 \
         --scaling-l1 0 --scaling-l2 2 \
         --upsampler modified-cubic \
-        --temporal on --temporal-sw-modifier 24 \
         --qm-beta 0.3 \
         --step-width-l1 1024 --step-width-l2 256 \
+        --no-psnr \
         "${TARGET_ARGS[@]}" \
         --base-out "${OUT}.base.266" -o "${OUT}.lcevc" \
         --mux "${OUT}.mp4" \
