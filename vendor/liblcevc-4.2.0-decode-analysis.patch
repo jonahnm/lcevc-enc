@@ -25,8 +25,16 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
  
 diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/decode.c /tmp/opencode/lcevc-src/src/enhancement/src/decode.c
 --- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/decode.c	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/decode.c	2026-08-05 17:08:04.371064414 -0400
-@@ -127,6 +127,10 @@
++++ /tmp/opencode/lcevc-src/src/enhancement/src/decode.c	2026-08-05 17:44:48.551110767 -0400
+@@ -104,6 +104,7 @@
+ 
+ /*------------------------------------------------------------------------------*/
+ 
++uint64_t g_dbg_ts = 0;
+ bool ldeDecodeEnhancement(const LdeGlobalConfig* globalConfig, const LdeFrameConfig* frameConfig,
+                           const LdeLOQIndex loq, const uint32_t planeIdx, const uint32_t tileIdx,
+                           LdeCmdBufferCpu* cmdBufferCpu, LdeCmdBufferGpu* cmdBufferGpu,
+@@ -127,6 +128,11 @@
      /* general */
      Dequant dequant;
      calculateDequant(&dequant, globalConfig, frameConfig, planeIdx, loq);
@@ -34,20 +42,28 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
 +        fprintf(stderr, "DQTBL sw0=%d sw1=%d: ", frameConfig->stepWidths[LOQ0], frameConfig->stepWidths[LOQ1]);
 +        lcevc_dump_dequant(&dequant, globalConfig->numLayers);
 +    }
++    g_dbg_ts = frameConfig->diagId;
      const bool temporalEnabled = globalConfig->temporalEnabled;
      const bool temporalRefresh = temporalEnabled && frameConfig->temporalRefresh;
      const uint8_t numLayers = globalConfig->numLayers;
-@@ -290,6 +294,16 @@
+@@ -204,6 +210,7 @@
+         int32_t minZeroCount = INT_MAX;
+         coeffsNonzeroMask = entropyDecodeAllLayers(numLayers, tileHasEntropyDecode, (int32_t)tuState.tuTotal,
+                                                    residualDecoders, zeros, coeffs, &minZeroCount);
++        { static int evc = 0; if (evc < 4000) { fprintf(stderr, "EV %d ts=%lu loq=%d pl=%d tu=%d l0=%d z0=%d\n", evc, frameConfig->diagId, loq, planeIdx, tuIndex, coeffs[0], zeros[0]); evc++; } }
+ 
+         if (coeffsNonzeroMask < 0) {
+             VNLogError("Entropy decode failed - likely stream corruption");
+@@ -290,6 +297,15 @@
                   * signal residual could be zero (implied inter), however the block signal
                   * could be intra. */
  
 +                {
 +                    static int dumpcnt = 0;
-+                    if (dumpcnt < 3 && loq == LOQ1 && planeIdx == 0 && tuIndex == 0) {
-+                        fprintf(stderr, "COEFFS tu=%d:", tuIndex);
-+                        for (uint8_t l = 0; l < numLayers; l++) fprintf(stderr, " %d", coeffs[l]);
++                    if (dumpcnt < 2 && loq == LOQ1 && planeIdx == 0 && tuIndex < 12) {
++                        fprintf(stderr, "COEFFS ts=%lu frame=%d tu=%d l0=%d run=%d", frameConfig->diagId, dumpcnt, tuIndex, coeffs[0], zeros[0]);
 +                        fprintf(stderr, "\n");
-+                        dumpcnt++;
++                        if (tuIndex == 11) dumpcnt++;
 +                    }
 +                }
 +
@@ -101,6 +117,60 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
 +void lcevc_dump_dequant(const Dequant* dequant, int nlayers);
 +
  #endif // VN_LCEVC_ENHANCEMENT_DEQUANT_H
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/entropy.c /tmp/opencode/lcevc-src/src/enhancement/src/entropy.c
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/entropy.c	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/enhancement/src/entropy.c	2026-08-05 17:37:32.930757954 -0400
+@@ -191,6 +191,7 @@
+         if ((symbol = symbolGetterFn(state)) < 0) {                                    \
+             return symbol;                                                             \
+         }                                                                              \
++        { static int symcnt = 0; if (symcnt < 24) { fprintf(stderr, "SYM %d = %02x\n", symcnt, (uint8_t)symbol); symcnt++; } } \
+                                                                                        \
+         if (nextSymbolIsMSB(symbol)) {                                                 \
+             value = (int16_t)(symbol & 0xFE);                                          \
+@@ -208,6 +209,7 @@
+         }                                                                              \
+                                                                                        \
+         *out = value;                                                                  \
++        { static int evc = 0; if (evc < 24) { fprintf(stderr, "EV %d val=%d\n", evc, value); evc++; } } \
+                                                                                        \
+         while (nextSymbolIsRL(symbol)) {                                               \
+             if ((symbol = symbolGetterFn(state)) < 0) {                                \
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/huffman.c /tmp/opencode/lcevc-src/src/enhancement/src/huffman.c
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/huffman.c	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/enhancement/src/huffman.c	2026-08-05 17:56:00.764906684 -0400
+@@ -97,6 +97,7 @@
+         }
+         entriesInOut[idx].code = currCode++;
+     }
++    { extern uint64_t g_dbg_ts; if (g_dbg_ts == 2130 || g_dbg_ts == 0) { fprintf(stderr, "GENCODES ts=%lu max=%d\n", g_dbg_ts, (int)maxIdx); for (int i = 0; i < maxIdx && i < 14; i++) fprintf(stderr, "  sym=%u len=%u code=%04x\n", entriesInOut[i].symbol, entriesInOut[i].bits, entriesInOut[i].code); } }
+ }
+ 
+ /* Generate codes, without setting the idxOfEachBitSize array. This is because the final LSB list
+@@ -346,6 +347,8 @@
+ 
+     qsort(entriesOut, orderIdx, sizeof(HuffmanListEntry), listEntrySizeOrder);
+ 
++    { static int htc = 0; extern uint64_t g_dbg_ts; if (htc < 40) { fprintf(stderr, "HT%d ts=%lu min=%u max=%u n=%d\n", htc, g_dbg_ts, state->minCodeLength, state->maxCodeLength, orderIdx); for (int e = 0; e < orderIdx && e < 12; e++) fprintf(stderr, "  sym=%u len=%u\n", entriesOut[e].symbol, entriesOut[e].bits); htc++; } }
++
+     return orderIdx;
+ }
+ 
+@@ -770,12 +773,14 @@
+     int32_t zeros = triplet.rl;
+     const HuffmanManualDecodeState* rlState = &state->manualStates[HuffRL];
+     uint8_t rlDetectionSymbol = 0;
++    { static int rlc = 0; if (rlc < 32) { fprintf(stderr, "TRIP val=%d rl=%d seek=%d\n", *valueOut, triplet.rl, seekRunLengths ? 1 : 0); rlc++; } }
+     while (seekRunLengths) {
+         if (!huffmanLutDecode(&state->rlTable, stream, &rlDetectionSymbol)) {
+             if (!huffmanManualDecodeMaybeSingleSymbol(rlState, stream, &rlDetectionSymbol)) {
+                 return -1;
+             }
+         }
++        { static int rlc2 = 0; static uint64_t lastts = 0; extern uint64_t g_dbg_ts; if (g_dbg_ts != lastts) { rlc2 = 0; lastts = g_dbg_ts; } if (rlc2 < 30) { fprintf(stderr, "RLSYM %d ts=%lu = %02x\n", rlc2, g_dbg_ts, rlDetectionSymbol); rlc2++; } }
+         if (zeros >= (1 << 24)) {
+             return -1; // Don't overflow a 24-bit integer to prevent crashes on subsequent << 7
+         }
 diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp
 --- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp	1969-12-31 19:00:01.000000000 -0500
 +++ /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp	2026-08-05 16:29:02.819772019 -0400
