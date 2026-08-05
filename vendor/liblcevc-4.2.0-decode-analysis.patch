@@ -1,0 +1,70 @@
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_parser.c /tmp/opencode/lcevc-src/src/enhancement/src/config_parser.c
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_parser.c	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/enhancement/src/config_parser.c	2026-08-05 16:31:01.952924275 -0400
+@@ -1515,6 +1515,10 @@
+         return false;
+     }
+ 
++    fprintf(stderr, "PARSEIN: size=%zu first=%02x %02x %02x %02x last=%02x\n",
++            serializedSize, serialized[0], serialized[1], serialized[2], serialized[3],
++            serialized[serializedSize - 1]);
++
+     // Unencapsulate - output size will always be the same or smaller
+     size_t unencapsulatedSize = 0;
+     bool idr = false;
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_pool.c /tmp/opencode/lcevc-src/src/enhancement/src/config_pool.c
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_pool.c	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/enhancement/src/config_pool.c	2026-08-05 16:33:34.526644019 -0400
+@@ -104,6 +104,7 @@
+                               const uint8_t* serialized, size_t serializedSize,
+                               LdeGlobalConfig** globalConfigPtr, LdeFrameConfig* frameConfig)
+ {
++    fprintf(stderr, "POOLINSERT: ts=%lu size=%zu ptr=%p\n", timestamp, serializedSize, (void*)serialized);
+     ldeFrameConfigInitialize(configPool->dynamicAllocator, frameConfig);
+     frameConfig->diagId = timestamp;
+ 
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp	2026-08-05 16:29:02.819772019 -0400
+@@ -400,6 +400,8 @@
+ {
+     assert(timestamp != kInvalidTimestamp);
+ 
++    fprintf(stderr, "PROCESS: ts=%lu limit=%lu\n", timestamp, m_processingLimit.load());
++
+     // Move 'processing' point forwards
+     if (m_processingLimit != kInvalidTimestamp &&
+         pipeline::compareTimestamps(timestamp, m_processingLimit) < 0) {
+@@ -705,6 +707,10 @@
+         return nullptr;
+     }
+ 
++    fprintf(stderr, "REORDER: size=%u maxReorder=%u first=%lu processing=%d\n",
++            m_reorderIndex.size(), m_maxReorder, m_reorderIndex[0]->timestamp,
++            isProcessing(m_reorderIndex[0]) ? 1 : 0);
++
+     // If exceeded reorder limit, or flushing
+     if (m_reorderIndex.size() >= m_maxReorder || isProcessing(m_reorderIndex[0])) {
+         FrameBase* const frame{m_reorderIndex[0]};
+@@ -728,8 +734,8 @@
+     // Pull ready frames from reorder table
+     while (FrameBase* frame = getNextReordered()) {
+         const uint64_t timestamp{frame->timestamp};
++        fprintf(stderr, "START: ts=%lu\n", timestamp);
+         bool goodConfig = false;
+-
+         if (m_previousTimestamp != kInvalidTimestamp &&
+             pipeline::compareTimestamps(m_previousTimestamp, timestamp) > 0) {
+             // Frame has been flushed out of reorder queue too late - mark as passthrough
+@@ -750,6 +756,11 @@
+             ldeConfigPoolFramePassthrough(&m_configPool, &frame->globalConfig, &frame->config);
+         }
+ 
++        fprintf(stderr, "PARSED: ts=%lu goodConfig=%d passthrough=%d loq0=%d loq1=%d sw0=%d sw1=%d\n",
++                timestamp, goodConfig ? 1 : 0, frame->isPassthrough() ? 1 : 0,
++                frame->config.loqEnabled[0], frame->config.loqEnabled[1],
++                frame->config.stepWidths[0], frame->config.stepWidths[1]);
++
+         VNLogDebug(
+             "Start Frame: ts:%" PRIx64 " goodConfig:%d temporalEnabled:%d, temporalPresent:%d "
+             "temporalRefresh:%d loqEnabled[0]:%d loqEnabled[1]:%d skip:%d flush:%d passthrough:%d",
