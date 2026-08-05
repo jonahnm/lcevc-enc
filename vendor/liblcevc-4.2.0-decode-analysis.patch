@@ -23,6 +23,84 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
      ldeFrameConfigInitialize(configPool->dynamicAllocator, frameConfig);
      frameConfig->diagId = timestamp;
  
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/decode.c /tmp/opencode/lcevc-src/src/enhancement/src/decode.c
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/decode.c	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/enhancement/src/decode.c	2026-08-05 17:08:04.371064414 -0400
+@@ -127,6 +127,10 @@
+     /* general */
+     Dequant dequant;
+     calculateDequant(&dequant, globalConfig, frameConfig, planeIdx, loq);
++    if (loq == LOQ1 && planeIdx == 0) {
++        fprintf(stderr, "DQTBL sw0=%d sw1=%d: ", frameConfig->stepWidths[LOQ0], frameConfig->stepWidths[LOQ1]);
++        lcevc_dump_dequant(&dequant, globalConfig->numLayers);
++    }
+     const bool temporalEnabled = globalConfig->temporalEnabled;
+     const bool temporalRefresh = temporalEnabled && frameConfig->temporalRefresh;
+     const uint8_t numLayers = globalConfig->numLayers;
+@@ -290,6 +294,16 @@
+                  * signal residual could be zero (implied inter), however the block signal
+                  * could be intra. */
+ 
++                {
++                    static int dumpcnt = 0;
++                    if (dumpcnt < 3 && loq == LOQ1 && planeIdx == 0 && tuIndex == 0) {
++                        fprintf(stderr, "COEFFS tu=%d:", tuIndex);
++                        for (uint8_t l = 0; l < numLayers; l++) fprintf(stderr, " %d", coeffs[l]);
++                        fprintf(stderr, "\n");
++                        dumpcnt++;
++                    }
++                }
++
+                 for (uint8_t layer = 0; layer < numLayers; layer++) {
+                     if (coeffs[layer] > 0) {
+                         coeffs[layer] =
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.c /tmp/opencode/lcevc-src/src/enhancement/src/dequant.c
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.c	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/enhancement/src/dequant.c	2026-08-05 17:05:35.346626852 -0400
+@@ -19,6 +19,7 @@
+ #include <LCEVC/common/limit.h>
+ #include <LCEVC/enhancement/config_parser.h>
+ #include <math.h>
++#include <stdio.h>
+ #include <memory.h>
+ #include <stdint.h>
+ 
+@@ -186,6 +187,17 @@
+     return 0;
+ }
+ 
++void lcevc_dump_dequant(const Dequant* dequant, int nlayers)
++{
++    for (int t = 0; t < TSCount; t++) {
++        fprintf(stderr, "DQ t=%d:", t);
++        for (int l = 0; l < nlayers; l++) {
++            fprintf(stderr, " [%d,%d]", dequant->stepWidth[t][l], dequant->offset[t][l]);
++        }
++        fprintf(stderr, "\n");
++    }
++}
++
+ static int32_t applyChromaSWMultiplier(int32_t stepwidth, uint8_t multiplier)
+ {
+     return clampS32((stepwidth * (int32_t)multiplier) >> 6, QMinStepWidth, QMaxStepWidth);
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.h /tmp/opencode/lcevc-src/src/enhancement/src/dequant.h
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.h	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/enhancement/src/dequant.h	2026-08-05 17:06:09.354902749 -0400
+@@ -25,6 +25,7 @@
+ #include <smmintrin.h>
+ #elif VN_SDK_FEATURE(NEON)
+ #include <LCEVC/common/neon.h>
++
+ #endif
+ 
+ #include <stddef.h>
+@@ -96,4 +97,6 @@
+ 
+ /*------------------------------------------------------------------------------*/
+ 
++void lcevc_dump_dequant(const Dequant* dequant, int nlayers);
++
+ #endif // VN_LCEVC_ENHANCEMENT_DEQUANT_H
 diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp
 --- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp	1969-12-31 19:00:01.000000000 -0500
 +++ /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp	2026-08-05 16:29:02.819772019 -0400
@@ -68,3 +146,29 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
          VNLogDebug(
              "Start Frame: ts:%" PRIx64 " goodConfig:%d temporalEnabled:%d, temporalPresent:%d "
              "temporalRefresh:%d loqEnabled[0]:%d loqEnabled[1]:%d skip:%d flush:%d passthrough:%d",
+diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/tasks_base.cpp /tmp/opencode/lcevc-src/src/pipeline/src/tasks_base.cpp
+--- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/tasks_base.cpp	1969-12-31 19:00:01.000000000 -0500
++++ /tmp/opencode/lcevc-src/src/pipeline/src/tasks_base.cpp	2026-08-05 16:59:55.170326773 -0400
+@@ -467,6 +467,22 @@
+         VNLogError("taskApplyCmdBufferDirect failed");
+     }
+ 
++    if (data.enhancementTile->loq == LOQ1 && data.enhancementTile->plane == 0) {
++        static int l1cnt = 0;
++        char fn[128];
++        snprintf(fn, sizeof(fn), "/tmp/opencode/l1_dec_%03d.yuv", l1cnt++);
++        FILE* f = fopen(fn, "wb");
++        if (f) {
++            const LdpPictureLayout* lay = frame->getIntermediateLayout(LOQ1);
++            uint32_t w = lay->width;
++            uint32_t h = lay->height;
++            for (uint32_t r = 0; r < h; r++) {
++                fwrite(ppDesc.firstSample + (size_t)r * ppDesc.rowByteStride, 2, w, f);
++            }
++            fclose(f);
++        }
++    }
++
+     return nullptr;
+ }
+ 
