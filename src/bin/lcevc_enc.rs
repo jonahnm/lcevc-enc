@@ -579,7 +579,8 @@ fn run(args: &[String]) -> Result<(), String> {
             .unwrap_or(1.0)
             .ceil()
             .max(1.0) as u32;
-        let mut streamer = match lcevc_enc::base::VvcStreamer::start(&cfg, base_out_stream, refresh_sec) {
+        let stream_qp: i32 = vvc_qp.parse().unwrap_or(30);
+        let mut streamer = match lcevc_enc::base::VvcStreamer::start(&cfg, base_out_stream, refresh_sec, stream_qp) {
             Ok(s) => s,
             Err(e) => {
                 // The vvenc library is unavailable: fall back to chunked

@@ -33,6 +33,7 @@ impl VvcStreamer {
         cfg: &LcevcConfig,
         base_out: Option<&str>,
         refresh_sec: u32,
+        qp: i32,
     ) -> Result<VvcStreamer, String> {
         let (bw, bh) = {
             let d = cfg.loq_dimensions();
@@ -44,7 +45,7 @@ impl VvcStreamer {
         let pad_h = (bh + 15) / 16 * 16;
         let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let mut lib = crate::base::vvenc_lib::VvencLib::new(
-            pad_w, pad_h, 25, 24, ncpu as i32, refresh_sec.max(1) as i32, cfg.colour.as_ref(),
+            pad_w, pad_h, 25, qp, ncpu as i32, refresh_sec.max(1) as i32, cfg.colour.as_ref(),
         )?;
 
         let mut decode = std::process::Command::new("ffmpeg")
