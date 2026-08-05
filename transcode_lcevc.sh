@@ -20,6 +20,8 @@
 #   --gop N               GOP size in frames (overrides --keyframe-interval)
 #   --scale WxH           downscale the video before encoding (e.g. 3840x2160
 #                         for an 8K source; an 8K encode is ~4x slower)
+#   --base-scale N        base downscale factor per dimension: 2 = half-res
+#                         (default), 4 = quarter-res, 1 = full-res base
 #   --audio               remux the source audio into the output MP4 (needs
 #                         the system ffmpeg; uses stream copy, no re-encode)
 #   anything else         passed through to lcevc_enc (e.g. --frames N,
@@ -66,6 +68,7 @@ AUDIO=0
 KEYFRAME=""
 GOP=""
 SCALE=""
+BASE_SCALE=2
 ENCODE_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -93,12 +96,26 @@ while [ $# -gt 0 ]; do
             SCALE="$2"
             shift 2
             ;;
+        --base-scale)
+            BASE_SCALE="$2"
+            shift 2
+            ;;
         *)
             ENCODE_ARGS+=("$1")
             shift
             ;;
     esac
 done
+
+case "$BASE_SCALE" in
+    1) SCALING_L1=0; SCALING_L2=0 ;;
+    2) SCALING_L1=0; SCALING_L2=2 ;;
+    4) SCALING_L1=2; SCALING_L2=2 ;;
+    *)
+        echo "--base-scale must be 1 (full-res), 2 (half-res) or 4 (quarter-res), got $BASE_SCALE" >&2
+        exit 1
+        ;;
+esac
 
 if [ ! -x "$LCEVC_ENC" ]; then
     echo "lcevc_enc not found at $LCEVC_ENC (cargo build --release first)" >&2
@@ -193,7 +210,7 @@ elif [ -n "$KEYFRAME" ]; then
     GOP_ARGS+=(--base-gop-seconds "$KEYFRAME")
 fi
 
-echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, half-res pyramid, ${TOTAL_FRAMES:-?} frames) =="
+echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, ${BASE_SCALE}x base downscale, ${TOTAL_FRAMES:-?} frames) =="
 
 TARGET_ARGS=()
 if [ -n "$TOTAL" ]; then
@@ -213,7 +230,7 @@ set -o pipefail
         --base-mode vvc \
         --vvc-qp 24 --vvc-preset faster \
         --base-gop 30 \
-        --scaling-l1 0 --scaling-l2 2 \
+        --scaling-l1 $SCALING_L1 --scaling-l2 $SCALING_L2 \
         --upsampler modified-cubic \
         --qm-beta 0.3 \
         --step-width-l1 1024 --step-width-l2 512 \

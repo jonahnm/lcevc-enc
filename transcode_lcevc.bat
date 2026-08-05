@@ -55,6 +55,7 @@ set "AUDIO=0"
 set "KEYFRAME="
 set "GOP="
 set "SCALE="
+set "BASE_SCALE=2"
 set "EXTRA="
 :argloop
 if "%~1"=="" goto doneargs
@@ -93,10 +94,24 @@ if "%~1"=="--scale" (
     shift
     goto argloop
 )
+if "%~1"=="--base-scale" (
+    set "BASE_SCALE=%~2"
+    shift
+    shift
+    goto argloop
+)
 set "EXTRA=!EXTRA! %~1"
 shift
 goto argloop
 :doneargs
+set "SCALING_L1=0"
+set "SCALING_L2=2"
+if "!BASE_SCALE!"=="1" (set "SCALING_L1=0" & set "SCALING_L2=0")
+if "!BASE_SCALE!"=="4" (set "SCALING_L1=2" & set "SCALING_L2=2")
+if not "!BASE_SCALE!"=="1" if not "!BASE_SCALE!"=="2" if not "!BASE_SCALE!"=="4" (
+    echo --base-scale must be 1, 2 or 4, got !BASE_SCALE! 1>&2
+    exit /b 1
+)
 
 if not exist "%LCEVC_ENC%" (
     echo lcevc_enc not found at %LCEVC_ENC% ^(cargo build --release first^) 1>&2
@@ -163,7 +178,7 @@ del /q "%TEMP%\lcevc_frames.txt" "%TEMP%\lcevc_dur.txt" "%TEMP%\lcevc_fps.txt" 2
 
 echo == frames: dur=!DUR! fps=!FPS! fnum=!FNUM! fden=!FDEN! total=!TOTAL_FRAMES!
 
-echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, half-res pyramid, !TOTAL_FRAMES! frames^)
+echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, !BASE_SCALE!x base downscale, !TOTAL_FRAMES! frames^)
 
 rem Default total-bitrate budget: ~0.6 bpp scaled so 4K caps at 5 Mbps
 rem TOTAL (VVC base + enhancement); the encoder measures the base's
@@ -210,7 +225,7 @@ set "GOP_ARGS="
 if defined GOP set "GOP_ARGS=--base-gop !GOP!"
 if not defined GOP if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAME!"
 
-"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 0 --scaling-l2 2 --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 512 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! !COLOR_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
+"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 !SCALING_L1! --scaling-l2 !SCALING_L2! --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 512 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! !COLOR_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
 if errorlevel 1 (
     echo !! encode failed 1>&2
     exit /b 1
