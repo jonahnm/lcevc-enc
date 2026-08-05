@@ -965,7 +965,7 @@ impl Encoder {
         self.temporal_buffers = std::mem::take(&mut self.temporal_buffers);
         let frame = self.encode_frame_inner(source, base_picture, sw1, sw2)?;
         let size = frame.picture_config.len() + frame.encoded_data.len();
-        self.frame_index = idx;
+        self.frame_index = idx + 1;
         self.stats = stats;
 
         self.rc_prev_sw1 = sw1;
