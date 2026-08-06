@@ -330,30 +330,46 @@ fn stco_box(offsets: &[u32]) -> Vec<u8> {
     box_be(b"stco", &p)
 }
 
-fn stbl_box(stsd: Vec<u8>, n: u32, delta: u32, sizes: &[u32], offsets: &[u32]) -> Vec<u8> {
+fn ctts_box(offsets: &[i32]) -> Vec<u8> {
+    // Version 1 (signed offsets) with one (count, offset) pair per sample:
+    // PTS = DTS + ctts.
+    let mut p = Vec::new();
+    p.extend_from_slice(&[1, 0, 0, 0]); // version 1
+    p.extend_from_slice(&u32_be(offsets.len() as u32));
+    for o in offsets {
+        p.extend_from_slice(&u32_be(1));
+        p.extend_from_slice(&o.to_be_bytes());
+    }
+    box_be(b"ctts", &p)
+}
+
+fn stbl_box(stsd: Vec<u8>, n: u32, delta: u32, ctts: Option<&[i32]>, sizes: &[u32], offsets: &[u32]) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&stsd);
     p.extend_from_slice(&stts_box(n, delta));
+    if let Some(c) = ctts {
+        p.extend_from_slice(&ctts_box(c));
+    }
     p.extend_from_slice(&stsc_box());
     p.extend_from_slice(&stsz_box(sizes));
     p.extend_from_slice(&stco_box(offsets));
     box_be(b"stbl", &p)
 }
 
-fn minf_box(stsd: Vec<u8>, n: u32, delta: u32, sizes: &[u32], offsets: &[u32]) -> Vec<u8> {
+fn minf_box(stsd: Vec<u8>, n: u32, delta: u32, ctts: Option<&[i32]>, sizes: &[u32], offsets: &[u32]) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&vmhd_box());
     p.extend_from_slice(&dref_box());
-    p.extend_from_slice(&stbl_box(stsd, n, delta, sizes, offsets));
+    p.extend_from_slice(&stbl_box(stsd, n, delta, ctts, sizes, offsets));
     box_be(b"minf", &p)
 }
 
 fn mdia_box(handler: &[u8; 4], name: &str, timescale: u32, duration: u32, delta: u32,
-            stsd: Vec<u8>, n: u32, sizes: &[u32], offsets: &[u32]) -> Vec<u8> {
+            ctts: Option<&[i32]>, stsd: Vec<u8>, n: u32, sizes: &[u32], offsets: &[u32]) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&mdhd_box(timescale, duration));
     p.extend_from_slice(&hdlr_box(handler, name));
-    p.extend_from_slice(&minf_box(stsd, n, delta, sizes, offsets));
+    p.extend_from_slice(&minf_box(stsd, n, delta, ctts, sizes, offsets));
     box_be(b"mdia", &p)
 }
 
@@ -371,6 +387,7 @@ pub fn mux_mp4(
     height: u16,
     fps: u32,
     colour: Option<&crate::config::ColourInfo>,
+    au_pocs: Option<&[u64]>,
 ) -> Result<(), String> {
     let n = base_aus.len().min(enh_nals.len());
     if n == 0 {
@@ -380,6 +397,21 @@ pub fn mux_mp4(
     let delta = (timescale / fps.max(1)).max(1);
     let duration_ticks = (n as u32) * delta;
     let movie_duration = ((n as u32) * 1000 / fps.max(1)).max(1);
+
+    // The base access units are in the VVC decode order; their POC is the
+    // source frame index. Give every sample its source presentation
+    // timestamp (POC * delta) via a signed ctts offset from the sequential
+    // decode-order DTS so the demuxed base frames carry the same
+    // timestamps as their enhancement NALs.
+    let au_pocs = au_pocs.unwrap_or(&[]);
+    let ctts: Vec<i32> = if au_pocs.len() == n {
+        (0..n)
+            .map(|i| (au_pocs[i] as i64 - i as i64).saturating_mul(delta as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let ctts_opt = if ctts.is_empty() { None } else { Some(ctts.as_slice()) };
 
     // ---- ftyp + free ----
     let mut out = Vec::new();
@@ -437,7 +469,7 @@ pub fn mux_mp4(
         edts.extend_from_slice(&elst_box(movie_duration));
         trak_vvc.extend_from_slice(&box_be(b"edts", &edts));
         trak_vvc.extend_from_slice(&mdia_box(
-            b"vide", "VideoHandler", timescale, duration_ticks, delta,
+            b"vide", "VideoHandler", timescale, duration_ticks, delta, ctts_opt,
             std::mem::take(&mut vvc_stsd), n as u32, &base_sizes, &base_off_abs,
         ));
     }
@@ -453,7 +485,7 @@ pub fn mux_mp4(
         tref.extend_from_slice(&u32_be(1));
         trak_lcevc.extend_from_slice(&box_be(b"tref", &tref));
         trak_lcevc.extend_from_slice(&mdia_box(
-            b"vide", "VideoHandler", timescale, duration_ticks, delta,
+            b"vide", "VideoHandler", timescale, duration_ticks, delta, ctts_opt,
             std::mem::take(&mut lcevc_stsd), n as u32, &enh_sizes, &enh_off_abs,
         ));
     }

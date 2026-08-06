@@ -49,7 +49,7 @@ fn process_encoded_frame(
     out_file: &mut std::fs::File,
     base_dump: &mut Option<std::fs::File>,
     recon_dump: &mut Option<std::fs::File>,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
         let mut payloads = Vec::new();
         if encoded.idr {
             payloads.push((lcevc_enc::nal::BLOCK_SEQUENCE_CONFIG, cfg.write_sequence_config()));
@@ -60,7 +60,6 @@ fn process_encoded_frame(
 
         let nal = build_nal_unit(encoded.idr, &payloads);
         let nal_bytes = nal.len();
-        out_file.write_all(&nal).map_err(|e| e.to_string())?;
         *total_bytes += nal_bytes;
 
         if let Some(f) = base_dump.as_mut() {
@@ -120,7 +119,7 @@ fn process_encoded_frame(
             );
         }
         *frame_count += 1;
-        Ok(())
+        Ok(nal)
 }
 
 /// Encode one GOP's enhancement against its decoded base.
@@ -152,7 +151,7 @@ fn process_gop(
             }
             None => encoder.encode_frame_with_base(f, base)?,
         };
-        process_encoded_frame(
+        let _nal = process_encoded_frame(
             &encoded, f, frame_start, cfg, bit_depth, frames, run_start, no_psnr,
             frame_count, total_bytes, total_sse, total_samples, out_file, base_dump,
             recon_dump,
@@ -281,6 +280,17 @@ fn run(args: &[String]) -> Result<(), String> {
                     "bilinear" | "linear" => UpsampleType::Linear,
                     "cubic" => UpsampleType::Cubic,
                     "modified-cubic" => UpsampleType::ModifiedCubic,
+                    "adaptive" => {
+                        let taps = next(&mut i)?;
+                        let v: Vec<i16> = taps
+                            .split(',')
+                            .map(|t| t.parse().map_err(|_| "bad kernel tap"))
+                            .collect::<Result<_, _>>()?;
+                        if v.len() != 4 {
+                            return Err("adaptive kernel needs 4 taps".into());
+                        }
+                        UpsampleType::Adaptive { taps: [v[0], v[1], v[2], v[3]] }
+                    }
                     _ => return Err("bad upsampler".into()),
                 }
             }
@@ -386,7 +396,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let d = cfg.loq_dimensions();
             (d[2].0, d[2].1)
         };
-        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps, colour.as_ref())?;
+        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps, colour.as_ref(), None)?;
         eprintln!("muxed {mux_path} ({} frames, base {bw}x{bh})", base_aus.len());
         return Ok(());
     }
@@ -538,6 +548,11 @@ fn run(args: &[String]) -> Result<(), String> {
     // via stdin, VVC out via a pipe) feeding a decoder whose output the
     // enhancement consumes frame-by-frame. Memory stays bounded regardless
     // of the keyframe interval (the vvenc intra period is refresh_sec).
+    // Base-size EMA: the base stream grows one access unit per received
+    // frame, but the vvenc encoder's reorder delay means the file size lags
+    // the frame count. Using the per-frame size delta (smoothed) avoids
+    // underestimating the base bitrate, which would otherwise overshoot the
+    // total budget.
     let tb_for = |base_size: u64, n: u64| -> Option<usize> {
         if let Some(total) = total_kbps {
             let base_bps = if n > 0 { base_size * 8 * fps as u64 / n } else { 0 };
@@ -546,6 +561,24 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         target_kbps.map(|kbps| ((kbps as usize * 1000) / 8).max(1) / (fps.max(1) as usize).max(1))
     };
+    // Difficulty-weighted allocation state: frames whose base-only
+    // prediction error is large (motion/complexity) get a bigger share of
+    // the enhancement budget, smoothed with one frame of lag.
+    let mut rc_sse_prev: u64 = 0;
+    let mut rc_sse_avg: f64 = 0.0;
+    let mut rc_w_avg: f64 = 1.0;
+    fn weighted_tb(t: usize, prev: u64, avg: &mut f64, w_avg: &mut f64) -> usize {
+        if *avg > 0.0 {
+            let w = (prev as f64 / *avg).clamp(0.5, 2.0);
+            *avg = *avg * 0.95 + prev as f64 * 0.05;
+            // Normalise so the average allocation stays at the target.
+            *w_avg = *w_avg * 0.95 + w * 0.05;
+            let wn = w / *w_avg;
+            ((t as f64) * wn).round().max(1.0) as usize
+        } else {
+            t
+        }
+    }
 
         let mut read_count = 0u32;
         let mut read_next = |frame_source: &mut FrameSource,
@@ -572,6 +605,7 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(frame)
         };
+    let mut au_pocs_out: Vec<u64> = Vec::new();
     if base_mode == "vvc" && gop_size > 1 {
         let base_out_stream = if base_out_path.is_empty() { None } else { Some(base_out_path.as_str()) };
         let refresh_sec = base_gop_seconds
@@ -580,7 +614,7 @@ fn run(args: &[String]) -> Result<(), String> {
             .ceil()
             .max(1.0) as u32;
         let stream_qp: i32 = vvc_qp.parse().unwrap_or(30);
-        let mut streamer = match lcevc_enc::base::VvcStreamer::start(&cfg, base_out_stream, refresh_sec, stream_qp) {
+        let mut streamer = match lcevc_enc::base::VvcStreamer::start_preset(&cfg, base_out_stream, refresh_sec, stream_qp, &vvc_preset) {
             Ok(s) => s,
             Err(e) => {
                 // The vvenc library is unavailable: fall back to chunked
@@ -650,6 +684,16 @@ fn run(args: &[String]) -> Result<(), String> {
             std::collections::VecDeque::new();
         let mut sent = 0u64;
         let mut eof = false;
+        // The base access units are emitted in the VVC decode order (B-frame
+        // reordering), so the enhancement NALs must be written to the
+        // output in the same order or the muxed file pairs each base
+        // picture with the wrong enhancement. Buffer the NALs per source
+        // frame and release them as the corresponding access unit (its POC
+        // is the source frame index) is emitted.
+        let mut au_pocs: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+        let mut el_buf: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut el_done = 0usize;
+        let mut nwritten = 0usize;
         // The base pipeline's latency (the vvenc encoder's reorder holdback
         // plus the decoder's) is several tens of frames, so the encoder
         // must stay that far ahead of the decoder or the receive blocks
@@ -658,7 +702,9 @@ fn run(args: &[String]) -> Result<(), String> {
         for _ in 0..96 {
             match read_next(&mut frame_source, width, height, bit_depth, &mut verify_frames, verify)? {
                 Some(f) => {
-                    streamer.send_frame(&f, cfg.scaling_l1, cfg.scaling_l2)?;
+                    if let Some(p) = streamer.send_frame(&f, cfg.scaling_l1, cfg.scaling_l2)? {
+                        au_pocs.push_back(p);
+                    }
                     queue.push_back(f);
                     sent += 1;
                 }
@@ -672,7 +718,9 @@ fn run(args: &[String]) -> Result<(), String> {
             if !eof {
                 match read_next(&mut frame_source, width, height, bit_depth, &mut verify_frames, verify)? {
                     Some(f) => {
-                        streamer.send_frame(&f, cfg.scaling_l1, cfg.scaling_l2)?;
+                        if let Some(p) = streamer.send_frame(&f, cfg.scaling_l1, cfg.scaling_l2)? {
+                            au_pocs.push_back(p);
+                        }
                         queue.push_back(f);
                         sent += 1;
                     }
@@ -689,7 +737,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 Some(base) => {
                     if let Some(frame) = queue.pop_front() {
                 let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
-                let tb = tb_for(base_size, sent);
+                let tb = tb_for(base_size, sent).map(|t| weighted_tb(t, rc_sse_prev, &mut rc_sse_avg, &mut rc_w_avg));
                 let frame_start = std::time::Instant::now();
                 let encoded = match tb {
                     Some(tb) => {
@@ -698,11 +746,30 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     None => encoder.encode_frame_with_base(&frame, &base)?,
                 };
-                process_encoded_frame(
+                rc_sse_prev = encoded.base_only_sse;
+                if rc_sse_avg == 0.0 {
+                    rc_sse_avg = rc_sse_prev as f64;
+                }
+                let nal = process_encoded_frame(
                     &encoded, &frame, frame_start, &cfg, bit_depth, frames, run_start,
                     no_psnr, &mut frame_count, &mut total_bytes, &mut total_sse,
                     &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump,
                 )?;
+                if el_done == el_buf.len() {
+                    el_buf.push(None);
+                }
+                el_buf[el_done] = Some(nal);
+                el_done += 1;
+                while let Some(&poc) = au_pocs.front() {
+                    let idx = poc as usize;
+                    if idx >= el_buf.len() || el_buf[idx].is_none() {
+                        break;
+                    }
+                    if let Some(n) = el_buf[idx].take() {
+                        out_file.write_all(&n).map_err(|e| e.to_string())?;
+                        au_pocs.pop_front();
+                    }
+                }
                     }
                 }
                 None => break,
@@ -711,11 +778,13 @@ fn run(args: &[String]) -> Result<(), String> {
         // End of input: flush the encoder (delivering the remaining access
         // units) and close the decoder's input so its reordered backlog is
         // emitted, then drain everything.
-        streamer.finish_flush()?;
+        for p in streamer.finish_flush()? {
+            au_pocs.push_back(p);
+        }
         while let Some(base) = streamer.recv_frame()? {
             if let Some(frame) = queue.pop_front() {
                 let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
-                let tb = tb_for(base_size, sent);
+                let tb = tb_for(base_size, sent).map(|t| weighted_tb(t, rc_sse_prev, &mut rc_sse_avg, &mut rc_w_avg));
                 let frame_start = std::time::Instant::now();
                 let encoded = match tb {
                     Some(tb) => {
@@ -724,13 +793,45 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     None => encoder.encode_frame_with_base(&frame, &base)?,
                 };
-                process_encoded_frame(
+                rc_sse_prev = encoded.base_only_sse;
+                if rc_sse_avg == 0.0 {
+                    rc_sse_avg = rc_sse_prev as f64;
+                }
+                let nal = process_encoded_frame(
                     &encoded, &frame, frame_start, &cfg, bit_depth, frames, run_start,
                     no_psnr, &mut frame_count, &mut total_bytes, &mut total_sse,
                     &mut total_samples, &mut out_file, &mut base_dump, &mut recon_dump,
                 )?;
+                if el_done == el_buf.len() {
+                    el_buf.push(None);
+                }
+                el_buf[el_done] = Some(nal);
+                el_done += 1;
+                while let Some(&poc) = au_pocs.front() {
+                    let idx = poc as usize;
+                    if idx >= el_buf.len() || el_buf[idx].is_none() {
+                        break;
+                    }
+                    if let Some(n) = el_buf[idx].take() {
+                        out_file.write_all(&n).map_err(|e| e.to_string())?;
+                        au_pocs.pop_front();
+                        nwritten += 1;
+                    }
+                }
             }
         }
+        while let Some(&poc) = au_pocs.front() {
+            let idx = poc as usize;
+            if idx >= el_buf.len() || el_buf[idx].is_none() {
+                break;
+            }
+            if let Some(n) = el_buf[idx].take() {
+                out_file.write_all(&n).map_err(|e| e.to_string())?;
+                au_pocs.pop_front();
+            }
+        }
+        eprintln!("DEBUG au_pocs={} el_done={} nwritten={} front={:?} left={:?}", streamer.au_pocs.len(), el_done, nwritten, au_pocs.front(), el_buf.iter().enumerate().filter(|(_, v)| v.is_some()).map(|(i, _)| i).take(20).collect::<Vec<_>>());
+        au_pocs_out = std::mem::take(&mut streamer.au_pocs);
         streamer.finish()?;
     } else {
         let mut read_count = 0u32;
@@ -801,7 +902,8 @@ fn run(args: &[String]) -> Result<(), String> {
             let d = cfg.loq_dimensions();
             (d[2].0, d[2].1)
         };
-        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps, colour.as_ref())?;
+        lcevc_enc::mp4::mux_mp4(mux_path, &base_aus, &enh_nals, bw, bh, fps, colour.as_ref(),
+                                Some(&au_pocs_out))?;
         eprintln!("muxed {mux_path} ({} frames, base {bw}x{bh})", base_aus.len());
     }
 

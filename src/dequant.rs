@@ -162,6 +162,9 @@ impl DequantTable {
         dequant_offset_mode: bool,
     ) -> DequantTable {
         let mut layers = Vec::new();
+        if std::env::var("LCEVC_DUMP_DQ").is_ok() && loq_sw > 100 {
+            eprintln!("MIRROR_DQ sw={loq_sw}:");
+        }
         for temporal in [TemporalSignal::Inter, TemporalSignal::Intra] {
             let mut temporal_sw = loq_sw.clamp(QMIN_STEP_WIDTH, QMAX_STEP_WIDTH);
             if temporal == TemporalSignal::Inter && loq_is_zero && temporal_enabled
@@ -197,6 +200,19 @@ impl DequantTable {
                     applied.clamp(i16::MIN as i64, i16::MAX as i64) as i16
                 };
 
+                if std::env::var("LCEVC_DUMP_DQ").is_ok() && loq_sw > 100 {
+                    eprintln!(
+                        "  t={} l={} sw={} off={}",
+                        temporal as usize,
+                        row.len(),
+                        layer_sw,
+                        if dequant_offset == -1 || !dequant_offset_mode {
+                            (-calculate_deadzone_width(temporal_sw, layer_sw)) as i16
+                        } else {
+                            offset
+                        }
+                    );
+                }
                 row.push(DequantLayer {
                     step_width: layer_sw as i16,
                     offset,

@@ -39,21 +39,37 @@ cargo build --release
 
 Decodes any ffmpeg-readable input, pipes it through `yuv4mpegpipe`
 (8-bit or 10-bit HDR is preserved), encodes with a VVC base at QP 24
-(half-res pyramid, modified-cubic upsampler, temporal prediction, RDOQ)
+(half-res pyramid, 2x2 transform, signalled Lanczos-2 upsampler kernel,
+per-TU adaptive residual, RDOQ lambda 4, difficulty-weighted rate control)
 and muxes a dual-track MP4:
 
 ```sh
 # Linux/macOS:
-./transcode_lcevc.sh input.mkv out --target-kbps 8000 --audio
+./transcode_lcevc.sh input.mkv out --audio
 
 # Windows:
-transcode_lcevc.bat input.mkv out --target-kbps 8000 --audio
+transcode_lcevc.bat input.mkv out --audio
 ```
 
-`--target-kbps N` rate-controls the enhancement layer toward N kbps;
-without it the fixed step widths 1024/256 are used. Produces
-`out.mp4` (VVC base + LCEVC enhancement), `out.lcevc` and `out.base.266`.
+By default the total bitrate (base + enhancement) is rate-controlled:
+~0.84 bpp, so 4K caps at 7 Mbps (`--total-kbps N` overrides, or
+`--target-kbps N` for an enhancement-only target). Produces `out.mp4`
+(VVC base + LCEVC enhancement), `out.lcevc` and `out.base.266`.
 `--audio` remuxes the source audio into the MP4 (stream copy).
+
+Useful knobs (see the script header for the full list):
+
+```sh
+./transcode_lcevc.sh in.mkv out --transform 4x4 \
+    --upsampler modified-cubic \          # or: adaptive -1023,9214,9214,-1023
+    --rdoq-lambda-div 8 \                 # weaker RDOQ rate penalty
+    --vvc-preset slow \                   # stronger base (1080p)
+    --temporal on --temporal-sw-modifier 24   # temporal prediction
+```
+
+The signalled (`adaptive`) upsampler kernel is spec 8.6.7: the four taps
+are carried in the global config, so the reference decoder applies exactly
+the encoder's filter (no decoder modification needed).
 
 ## Usage
 

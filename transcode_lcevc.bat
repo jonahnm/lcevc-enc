@@ -18,6 +18,15 @@ rem   --target-kbps N       rate-control the enhancement toward N kbps
 rem   --keyframe-interval N keyframe (GOP) interval in seconds
 rem   --gop N               GOP size in frames (overrides --keyframe-interval)
 rem   --scale WxH           downscale the video before encoding
+rem   --transform 2x2|4x4   residual transform (default 2x2)
+rem   --upsampler MODE [K0,K1,K2,K3]
+rem                         nearest|bilinear|cubic|modified-cubic|adaptive
+rem                         (adaptive signals a custom 4-tap kernel, e.g.
+rem                          --upsampler adaptive -1023,9214,9214,-1023;
+rem                          default)
+rem   --kernel K0,K1,K2,K3  shorthand for --upsampler adaptive K0,K1,K2,K3
+rem   --rdoq-lambda-div N   RDOQ rate penalty divisor (default 4)
+rem   --vvc-preset NAME     vvenc preset (faster|fast|medium|slow)
 rem   --audio               remux the source audio into the output MP4
 rem                         (stream copy, no re-encode)
 rem   anything else      passed through to lcevc_enc (e.g. --frames N,
@@ -56,6 +65,10 @@ set "KEYFRAME="
 set "GOP="
 set "SCALE="
 set "BASE_SCALE=2"
+set "TRANSFORM=2x2"
+set "UPSAMPLER=--upsampler adaptive -1023,9214,9214,-1023"
+set "LAMBDA_DIV=4"
+set "PRESET=faster"
 set "EXTRA="
 :argloop
 if "%~1"=="" goto doneargs
@@ -96,6 +109,51 @@ if "%~1"=="--scale" (
 )
 if "%~1"=="--base-scale" (
     set "BASE_SCALE=%~2"
+    shift
+    shift
+    goto argloop
+)
+if "%~1"=="--transform" (
+    if "%~2"=="2x2" (set "TRANSFORM=2x2") else if "%~2"=="4x4" (set "TRANSFORM=4x4") else (
+        echo --transform must be 2x2 or 4x4, got %~2 1>&2
+        exit /b 1
+    )
+    shift
+    shift
+    goto argloop
+)
+if "%~1"=="--upsampler" (
+    set "U=%~2"
+    if "!U!"=="adaptive" (
+        if "%~3"=="" (
+            echo --upsampler adaptive needs the 4 kernel taps, e.g. --upsampler adaptive -1023,9214,9214,-1023 1>&2
+            exit /b 1
+        )
+        set "UPSAMPLER=--upsampler adaptive %~3"
+        shift
+        shift
+        shift
+    ) else (
+        set "UPSAMPLER=--upsampler !U!"
+        shift
+        shift
+    )
+    goto argloop
+)
+if "%~1"=="--kernel" (
+    set "UPSAMPLER=--upsampler adaptive %~2"
+    shift
+    shift
+    goto argloop
+)
+if "%~1"=="--rdoq-lambda-div" (
+    set "LAMBDA_DIV=%~2"
+    shift
+    shift
+    goto argloop
+)
+if "%~1"=="--vvc-preset" (
+    set "PRESET=%~2"
     shift
     shift
     goto argloop
@@ -180,7 +238,7 @@ echo == frames: dur=!DUR! fps=!FPS! fnum=!FNUM! fden=!FDEN! total=!TOTAL_FRAMES!
 
 echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, !BASE_SCALE!x base downscale, !TOTAL_FRAMES! frames^)
 
-rem Default total-bitrate budget: ~0.6 bpp scaled so 4K caps at 5 Mbps
+rem Default total-bitrate budget: ~0.84 bpp scaled so 4K caps at 7 Mbps
 rem TOTAL (VVC base + enhancement); the encoder measures the base's
 rem actual bitrate per GOP and gives the rest to the enhancement.
 rem Pass --total-kbps to override, or --target-kbps for an
@@ -192,7 +250,7 @@ if not defined TOTAL if not defined TARGET (
     set "DH="
     "%FFPROBE%" -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "%INPUT%" > "%TEMP%\lcevc_h.txt" 2>nul
     if exist "%TEMP%\lcevc_h.txt" set /p DH=<"%TEMP%\lcevc_h.txt"
-    if defined DW if defined DH set /a TOTAL=DW*DH/1659 2>nul
+    if defined DW if defined DH set /a TOTAL=DW*DH/1185 2>nul
     if defined TOTAL if !TOTAL! LSS 800 set "TOTAL=800"
     if defined TOTAL if !TOTAL! GTR 30000 set "TOTAL=30000"
     del /q "%TEMP%\lcevc_w.txt" "%TEMP%\lcevc_h.txt" 2>nul
@@ -225,7 +283,10 @@ set "GOP_ARGS="
 if defined GOP set "GOP_ARGS=--base-gop !GOP!"
 if not defined GOP if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAME!"
 
-"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset faster --base-gop 30 --scaling-l1 !SCALING_L1! --scaling-l2 !SCALING_L2! --upsampler modified-cubic --qm-beta 0.3 --step-width-l1 1024 --step-width-l2 512 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! !COLOR_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
+echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, !BASE_SCALE!x base downscale, !TOTAL_FRAMES! frames, transform !TRANSFORM!^)
+
+set "LCEVC_RDOQ_LAMBDA_DIV=!LAMBDA_DIV!"
+"%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset !PRESET! --base-gop 30 --scaling-l1 !SCALING_L1! --scaling-l2 !SCALING_L2! --transform !TRANSFORM! !UPSAMPLER! --qm-beta 0.3 --step-width-l1 2000 --step-width-l2 1000 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! !COLOR_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
 if errorlevel 1 (
     echo !! encode failed 1>&2
     exit /b 1

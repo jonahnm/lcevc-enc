@@ -26,6 +26,9 @@ pub struct VvcStreamer {
     pad_w: usize,
     pad_h: usize,
     sent: u64,
+    /// POC (source frame index) of every emitted access unit, in emission
+    /// order; the base bitstream is in this decode order.
+    pub au_pocs: Vec<u64>,
 }
 
 impl VvcStreamer {
@@ -34,6 +37,16 @@ impl VvcStreamer {
         base_out: Option<&str>,
         refresh_sec: u32,
         qp: i32,
+    ) -> Result<VvcStreamer, String> {
+        Self::start_preset(cfg, base_out, refresh_sec, qp, "faster")
+    }
+
+    pub fn start_preset(
+        cfg: &LcevcConfig,
+        base_out: Option<&str>,
+        refresh_sec: u32,
+        qp: i32,
+        preset: &str,
     ) -> Result<VvcStreamer, String> {
         let (bw, bh) = {
             let d = cfg.loq_dimensions();
@@ -44,8 +57,9 @@ impl VvcStreamer {
         let pad_w = (bw + 15) / 16 * 16;
         let pad_h = (bh + 15) / 16 * 16;
         let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let mut lib = crate::base::vvenc_lib::VvencLib::new(
+        let mut lib = crate::base::vvenc_lib::VvencLib::new_preset(
             pad_w, pad_h, 25, qp, ncpu as i32, refresh_sec.max(1) as i32, cfg.colour.as_ref(),
+            preset,
         )?;
 
         let mut decode = std::process::Command::new("ffmpeg")
@@ -118,18 +132,20 @@ impl VvcStreamer {
             pad_w,
             pad_h,
             sent: 0,
+            au_pocs: Vec::new(),
         })
     }
 
     /// Downscale one source frame and encode it; the access unit (if the
     /// encoder emits one) is appended to the base file and handed to the
-    /// decoder.
+    /// decoder. Returns the emitted access unit's POC (the source frame it
+    /// represents), if any.
     pub fn send_frame(
         &mut self,
         frame: &crate::frame::Picture,
         scaling_l1: crate::config::ScalingMode,
         scaling_l2: crate::config::ScalingMode,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u64>, String> {
         let mut bp = crate::frame::Picture::new(self.width, self.height, crate::config::ChromaFormat::C420);
         for p in 0..frame.planes.len() {
             let l1 = crate::upscale::downscale_plane(&frame.planes[p], scaling_l2, 10);
@@ -164,11 +180,17 @@ impl VvcStreamer {
         }
         let lib = self.lib.as_mut().unwrap();
         let au = lib.encode_frame(&planes, pw, ph)?;
+        let mut emitted = None;
         if let Some(au) = au {
+            if std::env::var("LCEVC_DUMP_AU").is_ok() {
+                eprintln!("AU sent={} poc={} rap={} size={}", self.sent, au.poc, au.rap, au.data.len());
+            }
+            emitted = Some(au.poc);
+            self.au_pocs.push(au.poc);
             self.write_au(&au.data)?;
         }
         self.sent += 1;
-        Ok(())
+        Ok(emitted)
     }
 
     fn write_au(&mut self, data: &[u8]) -> Result<(), String> {
@@ -196,14 +218,17 @@ impl VvcStreamer {
     /// Flush the encoder (delivering the remaining access units) and close
     /// the decoder's input so it can emit its reordered backlog. The caller
     /// drains the remaining decoded frames afterwards, then calls `finish`.
-    pub fn finish_flush(&mut self) -> Result<(), String> {
+    pub fn finish_flush(&mut self) -> Result<Vec<u64>, String> {
+        let mut flushed = Vec::new();
         if let Some(lib) = self.lib.as_mut() {
             for au in lib.flush()? {
+                self.au_pocs.push(au.poc);
+                flushed.push(au.poc);
                 self.write_au(&au.data)?;
             }
         }
         self.decode_stdin.take();
-        Ok(())
+        Ok(flushed)
     }
 
     /// Verify the decoder terminated cleanly.

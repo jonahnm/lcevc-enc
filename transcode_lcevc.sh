@@ -14,7 +14,8 @@
 #
 # Options:
 #   --target-kbps N       rate-control the enhancement toward N kbps
-#                         (default: fixed step widths 1024/256)
+#                         (default: rate-control the total toward 5 Mbps,
+#                          7 Mbps at 4K)
 #   --keyframe-interval N keyframe (GOP) interval in seconds; the base is
 #                         encoded per GOP (one vvenc invocation per group)
 #   --gop N               GOP size in frames (overrides --keyframe-interval)
@@ -22,6 +23,22 @@
 #                         for an 8K source; an 8K encode is ~4x slower)
 #   --base-scale N        base downscale factor per dimension: 2 = half-res
 #                         (default), 4 = quarter-res, 1 = full-res base
+#   --transform 2x2|4x4   residual transform: 2x2 (DD, 4 layers, default) or
+#                         4x4 (DDS, 16 layers). 2x2 is more efficient at
+#                         low bitrates.
+#   --upsampler MODE [K0,K1,K2,K3]
+#                         upsampler: nearest|bilinear|cubic|modified-cubic
+#                         |adaptive. "adaptive" signals a custom 4-tap
+#                         kernel (spec 8.6.7); the taps must follow, e.g.
+#                         --upsampler adaptive -1023,9214,9214,-1023.
+#                         Default: adaptive with the Lanczos-2 kernel
+#                         {-1023, 9214, 9214, -1023}.
+#   --kernel K0,K1,K2,K3  shorthand for --upsampler adaptive K0,K1,K2,K3
+#   --rdoq-lambda-div N   RDOQ rate penalty divisor (LCEVC_RDOQ_LAMBDA_DIV);
+#                         larger = weaker penalty = more coefficients kept.
+#                         Default 4 (tuned for ~7 Mbps 4K).
+#   --vvc-preset NAME     vvenc preset for the VVC base (faster|fast|medium|
+#                         slow; default faster)
 #   --audio               remux the source audio into the output MP4 (needs
 #                         the system ffmpeg; uses stream copy, no re-encode)
 #   anything else         passed through to lcevc_enc (e.g. --frames N,
@@ -32,6 +49,11 @@
 # N/M with ETA. Temporal prediction is off by default (costs ~50%
 # ~20-50% encode time for ~+0.1 dB); enable them by passing
 # --temporal on --temporal-sw-modifier 24 or removing --no-rdoq.
+#
+# The default encode is tuned for ~7 Mbps 4K30: VVC base QP 24 at 1080p,
+# 2x2 transform, signalled Lanczos-2 upsampler kernel, per-TU adaptive
+# residual and RDOQ lambda 4, with difficulty-weighted rate control toward
+# the total budget.
 #
 # Environment:
 #   LCEVC_ENC   path to the lcevc_enc binary (default: target/release)
@@ -69,6 +91,10 @@ KEYFRAME=""
 GOP=""
 SCALE=""
 BASE_SCALE=2
+TRANSFORM="2x2"
+UPSAMPLER_ARGS=(--upsampler adaptive -1023,9214,9214,-1023)
+LAMBDA_DIV=4
+PRESET="faster"
 ENCODE_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -98,6 +124,44 @@ while [ $# -gt 0 ]; do
             ;;
         --base-scale)
             BASE_SCALE="$2"
+            shift 2
+            ;;
+        --transform)
+            case "$2" in
+                2x2|4x4) TRANSFORM="$2"; shift 2 ;;
+                *) echo "--transform must be 2x2 or 4x4, got $2" >&2; exit 1 ;;
+            esac
+            ;;
+        --upsampler)
+            case "$2" in
+                nearest|bilinear|linear|cubic|modified-cubic)
+                    UPSAMPLER_ARGS=(--upsampler "$2")
+                    shift 2
+                    ;;
+                adaptive)
+                    if [ -z "${3:-}" ]; then
+                        echo "--upsampler adaptive needs the 4 kernel taps, e.g. --upsampler adaptive -1023,9214,9214,-1023" >&2
+                        exit 1
+                    fi
+                    UPSAMPLER_ARGS=(--upsampler adaptive "$3")
+                    shift 3
+                    ;;
+                *)
+                    echo "--upsampler must be nearest|bilinear|cubic|modified-cubic|adaptive" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        --kernel)
+            UPSAMPLER_ARGS=(--upsampler adaptive "$2")
+            shift 2
+            ;;
+        --rdoq-lambda-div)
+            LAMBDA_DIV="$2"
+            shift 2
+            ;;
+        --vvc-preset)
+            PRESET="$2"
             shift 2
             ;;
         *)
@@ -176,7 +240,7 @@ if [ -n "$SCALE" ]; then
     VFILTER="scale=${SCALE}:flags=lanczos,format=${FORMAT}"
 fi
 
-# Default total-bitrate budget: ~0.6 bpp scaled so 4K caps at 5 Mbps
+# Default total-bitrate budget: ~0.84 bpp scaled so 4K caps at 7 Mbps
 # TOTAL (VVC base + enhancement); the encoder measures the base's actual
 # bitrate per GOP and gives the rest to the enhancement. Pass
 # --total-kbps to override, or --target-kbps for an enhancement-only
@@ -185,7 +249,7 @@ if [ -z "$TOTAL" ] && [ -z "$TARGET" ]; then
     DW="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
     DH="$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$INPUT" 2>/dev/null | head -1)"
     if [ -n "$DW" ] && [ -n "$DH" ] && [ "$DW" -gt 0 ] 2>/dev/null && [ "$DH" -gt 0 ] 2>/dev/null; then
-        TOTAL=$(awk -v w="$DW" -v h="$DH" 'BEGIN { t = w*h/8294400*5000; if (t < 800) t = 800; if (t > 30000) t = 30000; printf "%d", t }')
+        TOTAL=$(awk -v w="$DW" -v h="$DH" 'BEGIN { t = w*h/8294400*7000; if (t < 800) t = 800; if (t > 30000) t = 30000; printf "%d", t }')
     fi
 fi
 
@@ -210,7 +274,7 @@ elif [ -n "$KEYFRAME" ]; then
     GOP_ARGS+=(--base-gop-seconds "$KEYFRAME")
 fi
 
-echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, ${BASE_SCALE}x base downscale, ${TOTAL_FRAMES:-?} frames) =="
+echo "== transcode $INPUT -> ${OUT}.mp4 (base QP 24, ${DEPTH}-bit, ${BASE_SCALE}x base downscale, ${TOTAL_FRAMES:-?} frames, transform ${TRANSFORM}) =="
 
 TARGET_ARGS=()
 if [ -n "$TOTAL" ]; then
@@ -226,14 +290,15 @@ set -o pipefail
     -vf "$VFILTER" \
     -fps_mode cfr \
     -f yuv4mpegpipe -strict -1 -pix_fmt "$PIXFMT" - |
-    "$LCEVC_ENC" -i - --input-format y4m --bit-depth "$DEPTH" \
+    LCEVC_RDOQ_LAMBDA_DIV="$LAMBDA_DIV" "$LCEVC_ENC" -i - --input-format y4m --bit-depth "$DEPTH" \
         --base-mode vvc \
-        --vvc-qp 24 --vvc-preset faster \
+        --vvc-qp 24 --vvc-preset "$PRESET" \
         --base-gop 30 \
         --scaling-l1 $SCALING_L1 --scaling-l2 $SCALING_L2 \
-        --upsampler modified-cubic \
+        --transform "$TRANSFORM" \
+        "${UPSAMPLER_ARGS[@]}" \
         --qm-beta 0.3 \
-        --step-width-l1 1024 --step-width-l2 512 \
+        --step-width-l1 2000 --step-width-l2 1000 \
         --no-psnr \
         "${FRAMES_ARG[@]}" \
         "${GOP_ARGS[@]}" \

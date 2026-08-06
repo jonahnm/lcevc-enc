@@ -1,7 +1,46 @@
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_parser.c /tmp/opencode/lcevc-src/src/enhancement/src/config_parser.c
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_parser.c	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/config_parser.c	2026-08-05 16:31:01.952924275 -0400
-@@ -1515,6 +1515,10 @@
+diff -ru a/src/enhancement/src/chunk_parser.c b/src/enhancement/src/chunk_parser.c
+--- a/src/enhancement/src/chunk_parser.c	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/chunk_parser.c	2026-08-06 13:15:17.379118928 -0400
+@@ -33,6 +33,11 @@
+ static bool quantMatrixParseLOQ(ByteStream* stream, LdeLOQIndex loq, LdeFrameConfig* frameConfig,
+                                 const LdeGlobalConfig* globalConfig)
+ {
++    if (frameConfig->diagId == 2982 || frameConfig->diagId == 2556) {
++        fprintf(stderr, "DBGQM ts=%lu loq=%u numLayers=%u offset=%zu\n",
++                (unsigned long)frameConfig->diagId, (unsigned)loq,
++                (unsigned)globalConfig->numLayers, stream->offset);
++    }
+     uint8_t* values = quantMatrixGetValues(&frameConfig->quantMatrix, loq);
+ 
+     for (uint8_t layer = 0; layer < globalConfig->numLayers; layer++) {
+diff -ru a/src/enhancement/src/config_parser.c b/src/enhancement/src/config_parser.c
+--- a/src/enhancement/src/config_parser.c	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/config_parser.c	2026-08-06 13:13:45.733899157 -0400
+@@ -1303,6 +1303,11 @@
+ 
+     /* Process each block. */
+     const size_t initialOffset = stream->offset;
++    if (frameConfig->diagId == 2982) {
++        fprintf(stderr, "DBGPARSE ts=%lu blockType=%u sizeSignal=%u initialOffset=%zu remaining=%zu\n",
++                (unsigned long)frameConfig->diagId, (unsigned)blockType, (unsigned)blockSizeSignal,
++                initialOffset, bytestreamRemaining(stream));
++    }
+ 
+     const size_t remaining = bytestreamRemaining(stream);
+     if (blockSize > remaining) {
+@@ -1365,6 +1370,11 @@
+ 
+     /* Handle block misread. */
+     if ((stream->offset - initialOffset) - blockSize) {
++        if (frameConfig->diagId == 2982) {
++            fprintf(stderr, "DBGPARSE MISREAD ts=%lu blockType=%u consumed=%zu blockSize=%u\n",
++                    (unsigned long)frameConfig->diagId, (unsigned)blockType,
++                    stream->offset - initialOffset, blockSize);
++        }
+         VNLogError("Config parser: unparsed blocks of the stream remain. Initial offset: %u, "
+                    "Current offset: %u, Expected offset: %u",
+                    (uint32_t)initialOffset, (uint32_t)stream->offset,
+@@ -1515,6 +1525,10 @@
          return false;
      }
  
@@ -12,29 +51,48 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
      // Unencapsulate - output size will always be the same or smaller
      size_t unencapsulatedSize = 0;
      bool idr = false;
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_pool.c /tmp/opencode/lcevc-src/src/enhancement/src/config_pool.c
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/config_pool.c	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/config_pool.c	2026-08-05 16:33:34.526644019 -0400
-@@ -104,6 +104,7 @@
+diff -ru a/src/enhancement/src/config_pool.c b/src/enhancement/src/config_pool.c
+--- a/src/enhancement/src/config_pool.c	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/config_pool.c	2026-08-06 13:16:55.760440598 -0400
+@@ -104,6 +104,8 @@
                                const uint8_t* serialized, size_t serializedSize,
                                LdeGlobalConfig** globalConfigPtr, LdeFrameConfig* frameConfig)
  {
-+    fprintf(stderr, "POOLINSERT: ts=%lu size=%zu ptr=%p\n", timestamp, serializedSize, (void*)serialized);
++    fprintf(stderr, "POOLINSERT: ts=%lu size=%zu ptr=%p numLayers=%u initialized=%d\n", timestamp, serializedSize, (void*)serialized,
++            (unsigned)configPool->latestGlobalConfig->numLayers, configPool->latestGlobalConfig->initialized ? 1 : 0);
      ldeFrameConfigInitialize(configPool->dynamicAllocator, frameConfig);
      frameConfig->diagId = timestamp;
  
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/decode.c /tmp/opencode/lcevc-src/src/enhancement/src/decode.c
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/decode.c	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/decode.c	2026-08-05 17:44:48.551110767 -0400
-@@ -104,6 +104,7 @@
+diff -ru a/src/enhancement/src/decode.c b/src/enhancement/src/decode.c
+--- a/src/enhancement/src/decode.c	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/decode.c	2026-08-06 12:45:24.981253418 -0400
+@@ -34,6 +34,8 @@
+ 
+ /*------------------------------------------------------------------------------*/
+ 
++int g_dbg_layer = -1;
++
+ static inline int32_t entropyDecodeAllLayers(const uint8_t numLayers, const bool decoderExists,
+                                              const int32_t tuTotal,
+                                              EntropyDecoder residualDecoders[RCLayerCountDDS],
+@@ -42,6 +44,7 @@
+ {
+     int32_t coeffsNonZeroMask = 0;
+     for (uint8_t layer = 0; layer < numLayers; layer++) {
++        g_dbg_layer = layer;
+         if (zerosOut[layer] > 0) {
+             zerosOut[layer]--;
+             coeffsOut[layer] = 0;
+@@ -104,6 +107,8 @@
  
  /*------------------------------------------------------------------------------*/
  
 +uint64_t g_dbg_ts = 0;
++int g_dbg_loq = -1;
  bool ldeDecodeEnhancement(const LdeGlobalConfig* globalConfig, const LdeFrameConfig* frameConfig,
                            const LdeLOQIndex loq, const uint32_t planeIdx, const uint32_t tileIdx,
                            LdeCmdBufferCpu* cmdBufferCpu, LdeCmdBufferGpu* cmdBufferGpu,
-@@ -127,6 +128,11 @@
+@@ -127,6 +132,13 @@
      /* general */
      Dequant dequant;
      calculateDequant(&dequant, globalConfig, frameConfig, planeIdx, loq);
@@ -43,36 +101,86 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
 +        lcevc_dump_dequant(&dequant, globalConfig->numLayers);
 +    }
 +    g_dbg_ts = frameConfig->diagId;
++    g_dbg_loq = loq;
++    { static int lqc = 0; if (lqc < 40) { fprintf(stderr, "DECLOQ %d loq=%d pl=%u ts=%lu\n", lqc, loq, planeIdx, frameConfig->diagId); lqc++; } }
      const bool temporalEnabled = globalConfig->temporalEnabled;
      const bool temporalRefresh = temporalEnabled && frameConfig->temporalRefresh;
      const uint8_t numLayers = globalConfig->numLayers;
-@@ -204,6 +210,7 @@
+@@ -204,6 +216,7 @@
          int32_t minZeroCount = INT_MAX;
          coeffsNonzeroMask = entropyDecodeAllLayers(numLayers, tileHasEntropyDecode, (int32_t)tuState.tuTotal,
                                                     residualDecoders, zeros, coeffs, &minZeroCount);
-+        { static int evc = 0; if (evc < 4000) { fprintf(stderr, "EV %d ts=%lu loq=%d pl=%d tu=%d l0=%d z0=%d\n", evc, frameConfig->diagId, loq, planeIdx, tuIndex, coeffs[0], zeros[0]); evc++; } }
++        { static int evc = 0; static uint64_t lastts = 0; static int lastloq = -1; if (frameConfig->diagId != lastts || loq != lastloq) { evc = 0; lastts = frameConfig->diagId; lastloq = loq; } if (frameConfig->diagId == 1704 && loq == 0 && evc < 3000) { fprintf(stderr, "EVL2 %d ts=%lu loq=%d pl=%d tu=%d l0=%d z0=%d\n", evc, frameConfig->diagId, loq, planeIdx, tuIndex, coeffs[0], zeros[0]); evc++; } }
  
          if (coeffsNonzeroMask < 0) {
              VNLogError("Entropy decode failed - likely stream corruption");
-@@ -290,6 +297,15 @@
+@@ -290,6 +303,25 @@
                   * signal residual could be zero (implied inter), however the block signal
                   * could be intra. */
  
 +                {
 +                    static int dumpcnt = 0;
 +                    if (dumpcnt < 2 && loq == LOQ1 && planeIdx == 0 && tuIndex < 12) {
-+                        fprintf(stderr, "COEFFS ts=%lu frame=%d tu=%d l0=%d run=%d", frameConfig->diagId, dumpcnt, tuIndex, coeffs[0], zeros[0]);
++                        fprintf(stderr, "COEFFS ts=%lu frame=%d tu=%d l0=%d run=%d all=", frameConfig->diagId, dumpcnt, tuIndex, coeffs[0], zeros[0]);
++                        for (uint8_t l = 0; l < numLayers; l++) fprintf(stderr, " %d", coeffs[l]);
 +                        fprintf(stderr, "\n");
 +                        if (tuIndex == 11) dumpcnt++;
++                    }
++                    {
++                        static int l2cnt = 0;
++                        if (l2cnt < 2 && loq == LOQ0 && planeIdx == 0 && tuIndex < 8) {
++                            fprintf(stderr, "L2C ts=%lu tu=%d l0=%d all=", frameConfig->diagId, tuIndex, coeffs[0]);
++                            for (uint8_t l = 0; l < numLayers; l++) fprintf(stderr, " %d", coeffs[l]);
++                            fprintf(stderr, "\n");
++                            if (tuIndex == 7) l2cnt++;
++                        }
 +                    }
 +                }
 +
                  for (uint8_t layer = 0; layer < numLayers; layer++) {
                      if (coeffs[layer] > 0) {
                          coeffs[layer] =
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.c /tmp/opencode/lcevc-src/src/enhancement/src/dequant.c
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.c	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/dequant.c	2026-08-05 17:05:35.346626852 -0400
+@@ -303,9 +335,37 @@
+                                               INT16_MIN, INT16_MAX);
+                     }
+                 }
++                {
++                    static int dtc = 0;
++                    if (dtc < 40000 && planeIdx == 0 && coeffs[0] != 0) {
++                        fprintf(stderr, "DECTU %d loq=%d ts=%lu tu=%u c0=%d", dtc, loq, frameConfig->diagId, tuIndex, coeffs[0]);
++                        for (uint8_t l = 1; l < numLayers; l++) fprintf(stderr, ",%d", coeffs[l]);
++                        fprintf(stderr, " r=");
++                        for (int ri = 0; ri < (dds ? 16 : 4); ri++) fprintf(stderr, "%d,", residuals[ri]);
++                        fprintf(stderr, "\n");
++                        dtc++;
++                    }
++                }
+ 
+                 /* Inverse hadamard */
+                 transformFn(coeffs, residuals);
++                {
++                    static int dtc2 = 0;
++                    if (dtc2 < 40000 && planeIdx == 0 && coeffs[0] != 0) {
++                        fprintf(stderr, "DECTU2 %d loq=%d ts=%lu tu=%u r=", dtc2, loq, frameConfig->diagId, tuIndex);
++                        for (int ri = 0; ri < (dds ? 16 : 4); ri++) fprintf(stderr, "%d,", residuals[ri]);
++                        fprintf(stderr, "\n");
++                        dtc2++;
++                    }
++                }
++                {
++                    static int rescnt = 0;
++                    if (rescnt < 8 && loq == LOQ1 && planeIdx == 0 && tuIndex < 6) {
++                        fprintf(stderr, "RES ts=%lu tu=%d r0=%d r1=%d r2=%d r3=%d\n", frameConfig->diagId,
++                                tuIndex, residuals[0], residuals[1], residuals[2], residuals[3]);
++                        if (tuIndex == 5) rescnt++;
++                    }
++                }
+ 
+                 /* Apply deblocking coefficients when enabled. */
+                 if (LOQ1 == loq && dds && frameConfig->deblockEnabled) {
+diff -ru a/src/enhancement/src/dequant.c b/src/enhancement/src/dequant.c
+--- a/src/enhancement/src/dequant.c	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/dequant.c	2026-08-05 17:05:35.346626852 -0400
 @@ -19,6 +19,7 @@
  #include <LCEVC/common/limit.h>
  #include <LCEVC/enhancement/config_parser.h>
@@ -99,9 +207,9 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
  static int32_t applyChromaSWMultiplier(int32_t stepwidth, uint8_t multiplier)
  {
      return clampS32((stepwidth * (int32_t)multiplier) >> 6, QMinStepWidth, QMaxStepWidth);
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.h /tmp/opencode/lcevc-src/src/enhancement/src/dequant.h
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/dequant.h	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/dequant.h	2026-08-05 17:06:09.354902749 -0400
+diff -ru a/src/enhancement/src/dequant.h b/src/enhancement/src/dequant.h
+--- a/src/enhancement/src/dequant.h	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/dequant.h	2026-08-05 17:06:09.354902749 -0400
 @@ -25,6 +25,7 @@
  #include <smmintrin.h>
  #elif VN_SDK_FEATURE(NEON)
@@ -117,9 +225,9 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
 +void lcevc_dump_dequant(const Dequant* dequant, int nlayers);
 +
  #endif // VN_LCEVC_ENHANCEMENT_DEQUANT_H
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/entropy.c /tmp/opencode/lcevc-src/src/enhancement/src/entropy.c
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/entropy.c	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/entropy.c	2026-08-05 17:37:32.930757954 -0400
+diff -ru a/src/enhancement/src/entropy.c b/src/enhancement/src/entropy.c
+--- a/src/enhancement/src/entropy.c	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/entropy.c	2026-08-05 17:37:32.930757954 -0400
 @@ -191,6 +191,7 @@
          if ((symbol = symbolGetterFn(state)) < 0) {                                    \
              return symbol;                                                             \
@@ -136,9 +244,18 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
                                                                                         \
          while (nextSymbolIsRL(symbol)) {                                               \
              if ((symbol = symbolGetterFn(state)) < 0) {                                \
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/huffman.c /tmp/opencode/lcevc-src/src/enhancement/src/huffman.c
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/enhancement/src/huffman.c	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/enhancement/src/huffman.c	2026-08-05 17:56:00.764906684 -0400
+diff -ru a/src/enhancement/src/huffman.c b/src/enhancement/src/huffman.c
+--- a/src/enhancement/src/huffman.c	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/huffman.c	2026-08-06 12:27:22.863454008 -0400
+@@ -85,7 +85,7 @@
+                                     uint8_t maxCodeLength)
+ {
+     uint8_t currLength = maxCodeLength;
+-    uint8_t currCode = 0;
++    uint16_t currCode = 0;
+ 
+     idxOfEachBitSize[currLength] = maxIdx;
+ 
 @@ -97,6 +97,7 @@
          }
          entriesInOut[idx].code = currCode++;
@@ -147,34 +264,158 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
  }
  
  /* Generate codes, without setting the idxOfEachBitSize array. This is because the final LSB list
-@@ -346,6 +347,8 @@
+@@ -105,7 +106,7 @@
+                           uint8_t maxCodeLength)
+ {
+     uint8_t currLength = maxCodeLength;
+-    uint8_t currCode = 0;
++    uint16_t currCode = 0;
+ 
+     for (int16_t idx = maxIdx - 1; idx > -1; idx--) {
+         if (entriesInOut[idx].bits < currLength) {
+@@ -125,7 +126,7 @@
+ {
+     memset(tableOut->code, 0, sizeof(tableOut->code));
+     uint8_t currLength = maxCodeLength;
+-    uint8_t currCode = 0;
++    uint16_t currCode = 0;
+     uint8_t minOversizedCodeIdx = maxIdx;
+ 
+     /* This list is sorted from large to small, so start by assigning list entries for codes which
+@@ -152,6 +153,7 @@
+             }
+         }
+ 
++        { extern int g_dbg_loq; extern uint64_t g_dbg_ts; static int gc = 0; if (g_dbg_loq == 0 && g_dbg_ts == 1704 && gc < 8) { fprintf(stderr, "GCL idx=%d len=%u cc=%u ec=%04x\n", idx, entry->bits, currCode, entry->code); gc++; } }
+         currCode++;
+     }
+     return minOversizedCodeIdx;
+@@ -244,6 +246,7 @@
+ 
+     VNCheckI(huffmanStreamReadBits(stream, 5, &bits));
+     state->maxCodeLength = (uint8_t)bits;
++    { extern uint64_t g_dbg_ts; extern int g_dbg_loq; if ((g_dbg_ts == 426 || g_dbg_ts == 1704)) { fprintf(stderr, "MINMAX ts=%lu loq=%d min=%u max=%u word=%08x sb=%u eb=%u data=", g_dbg_ts, g_dbg_loq, state->minCodeLength, state->maxCodeLength, stream->word, stream->wordStartBit, stream->wordEndBit); for (int i = 0; i < 8 && (size_t)i < stream->byteStream.size; i++) fprintf(stderr, "%02x", stream->byteStream.data[i]); fprintf(stderr, "\n"); } }
+ 
+     if (state->maxCodeLength < state->minCodeLength) {
+         VNLogError("Huffman code lengths are invalid, max length [%u] is less than min length [%u]",
+@@ -346,6 +349,8 @@
  
      qsort(entriesOut, orderIdx, sizeof(HuffmanListEntry), listEntrySizeOrder);
  
-+    { static int htc = 0; extern uint64_t g_dbg_ts; if (htc < 40) { fprintf(stderr, "HT%d ts=%lu min=%u max=%u n=%d\n", htc, g_dbg_ts, state->minCodeLength, state->maxCodeLength, orderIdx); for (int e = 0; e < orderIdx && e < 12; e++) fprintf(stderr, "  sym=%u len=%u\n", entriesOut[e].symbol, entriesOut[e].bits); htc++; } }
++    { static int htc = 0; extern uint64_t g_dbg_ts; extern int g_dbg_loq; if ((g_dbg_ts == 426 || g_dbg_ts == 1704) && htc < 40) { fprintf(stderr, "HT%d loq=%d ts=%lu min=%u max=%u n=%d\n", htc, g_dbg_loq, g_dbg_ts, state->minCodeLength, state->maxCodeLength, orderIdx); for (int e = 0; e < orderIdx && e < 12; e++) fprintf(stderr, "  sym=%u len=%u\n", entriesOut[e].symbol, entriesOut[e].bits); htc++; } }
 +
      return orderIdx;
  }
  
-@@ -770,12 +773,14 @@
+@@ -460,6 +465,9 @@
+                                      const HuffmanTable* rlTable, const HuffmanList* rlList)
+ {
+     HuffmanList* overflowLsbListOut = &huffmanState->manualStates[HuffLSB].list;
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; if ((g_dbg_ts == 426 || g_dbg_ts == 1704)) { static int lsc = 0; if (lsc < 40) { fprintf(stderr, "LSBL loq=%d ts=%lu n=%u\n", g_dbg_loq, g_dbg_ts, fullLsbListIn->size); for (uint8_t i = 0; i < fullLsbListIn->size; i++) { const HuffmanListEntry* e = &fullLsbListIn->list[i]; uint8_t lz = clz(e->code, e->bits); int8_t bll = VN_BIG_TABLE_MAX_CODE_SIZE - (e->bits - lz); uint16_t si = (uint16_t)(e->code << (bll < 0 ? 0 : bll)) | (lz << VN_BIG_TABLE_MAX_CODE_SIZE); fprintf(stderr, "  sym=%02x len=%u code=%04x lz=%u bll=%d start=%04x\n", e->symbol, e->bits, e->code, lz, bll, si); } lsc++; } } }
++
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; if (g_dbg_ts == 426) { fprintf(stderr, "LSBL2 loq=%d n=%u\n", g_dbg_loq, huffmanState->manualStates[HuffLSB].list.size); } }
+     uint8_t lsbIdx = 0;
+     for (; lsbIdx < fullLsbListIn->size; lsbIdx++) {
+         const HuffmanListEntry* lsbEntry = &fullLsbListIn->list[lsbIdx];
+@@ -509,6 +517,9 @@
+     if (overflowLsbListOut->size > 0) {
+         determineIdxOfEachBitSize(overflowLsbListOut);
+     }
++
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; if (g_dbg_loq == 0 && g_dbg_ts == 1704) { static int ltc = 0; if (ltc < 1) { static const uint16_t idxs[] = {0x5c6, 0x4ca, 0x3ec, 0x4c9, 0x2c8, 0x5c5, 0x1d5, 0x58f, 0x5bd, 0x1ea, 0x686, 0x96, 0x2fd, 0x2df, 0x4d0, 0x80, 0x100, 0x1c0, 0x280, 0x2c0, 0x380, 0x3c0, 0x480, 0x4a0, 0x4c0, 0x580, 0x5a0, 0x5c0, 0x5e0, 0x680, 0x6a0, 0x780, 0x7c0, 0x880, 0x8a0, 0x8c0, 0x8e0, 0x980, 0x9c0, 0xa80, 0xb00}; for (unsigned i = 0; i < sizeof(idxs)/sizeof(idxs[0]); i++) { const HuffmanTriple* t = &huffmanTableOut->code[idxs[i]]; fprintf(stderr, "  LUT %04x: c=%02x lsb=%02x rl=%u\n", idxs[i], t->contents, t->lsb, t->rl); } ltc++; } } }
++
+ }
+ 
+ bool huffmanTripleInitialize(HuffmanTripleDecodeState* state, HuffmanStream* stream, uint8_t bitstreamVersion)
+@@ -591,6 +602,7 @@
+ 
+     const uint8_t minIdxOfOversizedCodes =
+         generateCodesAndLut(codes, table, (uint8_t)size, state->maxCodeLength);
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; if (g_dbg_loq == 0 && g_dbg_ts == 1704) { static int rlc3 = 0; if (rlc3 < 2) { fprintf(stderr, "RLC %d max=%u n=%u oversz=%u codes=%p table=%p\n", rlc3, state->maxCodeLength, size, minIdxOfOversizedCodes, (void*)codes, (void*)table); for (int e = 0; e < 8; e++) fprintf(stderr, "  sym=%02x len=%u code=%04x\n", codes[e].symbol, codes[e].bits, codes[e].code); rlc3++; } } }
+ 
+     state->list.size = size - minIdxOfOversizedCodes;
+     if (state->list.size > 0) {
+@@ -677,6 +689,7 @@
+     uint16_t lutIdx = (uint16_t)huffmanStreamAdvanceToNthBit(stream, VN_SMALL_TABLE_MAX_SIZE);
+     uint8_t bits = rlTable->code[lutIdx].bits;
+     stream->wordStartBit += bits;
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; static int ldcnt = 0; if (g_dbg_loq == 0 && g_dbg_ts == 1704 && ldcnt < 16) { fprintf(stderr, "LUTD idx=%u bits=%u sym=%02x ws=%u\n", lutIdx, bits, rlTable->code[lutIdx].symbol, stream->wordStartBit); ldcnt++; } }
+     if (bits != 0) {
+         assert(stream->wordStartBit <= 32);
+         *symbolOut = rlTable->code[lutIdx].symbol;
+@@ -718,12 +731,14 @@
+     const HuffmanTripleTable* table = &state->tripleTable;
+     HuffmanTriple triplet = table->code[lutIdx];
+     uint8_t bits = getBits(triplet.contents);
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; extern int g_dbg_layer; static int tdcnt2 = 0; static uint64_t lts2 = 0; if (g_dbg_ts != lts2) { tdcnt2 = 0; lts2 = g_dbg_ts; } if (g_dbg_loq == 0 && g_dbg_ts == 1704 && g_dbg_layer == 0 && tdcnt2 < 4000) { fprintf(stderr, "TRP2 %d idx=%04x bits=%u wsb=%u word=%08x lsb=%02x rl=%u\n", tdcnt2, lutIdx, bits, stream->wordStartBit, stream->word, (unsigned)((uint8_t)triplet.lsb) & 0xFF, (unsigned)triplet.rl); tdcnt2++; } }
+     stream->wordStartBit += bits;
+     assert(stream->wordStartBit <= 32);
+ 
+     /* Quickly dismiss the fast case: */
+     if (!isIncomplete(triplet.contents)) {
+         *valueOut = ((int16_t)(triplet.lsb & 0x7e) - 0x40) >> 1;
++        { extern int g_dbg_loq; extern uint64_t g_dbg_ts; extern int g_dbg_layer; static int fpdc = 0; static uint64_t ltsf = 0; if (g_dbg_ts != ltsf) { fpdc = 0; ltsf = g_dbg_ts; } if (g_dbg_loq == 0 && g_dbg_ts == 1704 && fpdc < 4000) { fprintf(stderr, "FST %d L=%d val=%d rl=%u idx=%04x\n", fpdc, g_dbg_layer, (int)*valueOut, (unsigned)triplet.rl, lutIdx); fpdc++; } }
+         return triplet.rl;
+     }
+ 
+@@ -748,6 +763,7 @@
+     } else {
+         *valueOut = triplet.lsb;
+     }
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; extern int g_dbg_layer; static int tdcnt = 0; if (g_dbg_loq == 0 && g_dbg_ts == 1704 && g_dbg_layer == 0 && tdcnt < 4000) { fprintf(stderr, "TRIPLE lsb=%u lz=%u idx=%04x bits=%u incompl=%u overflow=%u br=%u\n", (unsigned)((uint8_t)*valueOut) & 0xFF, lsbLeadingZeros, lutIdx, bits, isIncomplete(triplet.contents) ? 1 : 0, lsbOverflowed(triplet.contents) ? 1 : 0, stream->bitsRead); tdcnt++; } }
+ 
+     /* MSB */
+     if (nextSymbolIsMSB((uint8_t)*valueOut)) {
+@@ -770,12 +786,16 @@
      int32_t zeros = triplet.rl;
      const HuffmanManualDecodeState* rlState = &state->manualStates[HuffRL];
      uint8_t rlDetectionSymbol = 0;
 +    { static int rlc = 0; if (rlc < 32) { fprintf(stderr, "TRIP val=%d rl=%d seek=%d\n", *valueOut, triplet.rl, seekRunLengths ? 1 : 0); rlc++; } }
      while (seekRunLengths) {
-         if (!huffmanLutDecode(&state->rlTable, stream, &rlDetectionSymbol)) {
+-        if (!huffmanLutDecode(&state->rlTable, stream, &rlDetectionSymbol)) {
++        bool usedLut = huffmanLutDecode(&state->rlTable, stream, &rlDetectionSymbol);
++        if (!usedLut) {
              if (!huffmanManualDecodeMaybeSingleSymbol(rlState, stream, &rlDetectionSymbol)) {
                  return -1;
              }
          }
++        { extern int g_dbg_loq; extern uint64_t g_dbg_ts; extern int g_dbg_layer; static int rlcx = 0; static uint64_t lts = 0; if (g_dbg_ts != lts) { rlcx = 0; lts = g_dbg_ts; } if (g_dbg_ts == 1704 && g_dbg_loq == 0 && g_dbg_layer == 0 && rlcx < 4000) { fprintf(stderr, "RLX %d L=%d src=%s sym=%02x br=%u wsb=%u\n", rlcx, g_dbg_layer, usedLut ? "LUT" : "MAN", rlDetectionSymbol, stream->bitsRead, stream->wordStartBit); rlcx++; } }
 +        { static int rlc2 = 0; static uint64_t lastts = 0; extern uint64_t g_dbg_ts; if (g_dbg_ts != lastts) { rlc2 = 0; lastts = g_dbg_ts; } if (rlc2 < 30) { fprintf(stderr, "RLSYM %d ts=%lu = %02x\n", rlc2, g_dbg_ts, rlDetectionSymbol); rlc2++; } }
          if (zeros >= (1 << 24)) {
              return -1; // Don't overflow a 24-bit integer to prevent crashes on subsequent << 7
          }
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/pipeline_base.cpp	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/pipeline/src/pipeline_base.cpp	2026-08-05 16:29:02.819772019 -0400
-@@ -400,6 +400,8 @@
+@@ -783,6 +803,7 @@
+         seekRunLengths = nextSymbolIsRL(rlDetectionSymbol);
+     }
+ 
++    { extern int g_dbg_loq; extern uint64_t g_dbg_ts; extern int g_dbg_layer; static int fdc = 0; static uint64_t lts = 0; if (g_dbg_ts != lts) { fdc = 0; lts = g_dbg_ts; } if (g_dbg_ts == 426 && fdc < 4000) { fprintf(stderr, "FNL %d loq=%d L=%d val=%d zeros=%u br=%u\n", fdc, g_dbg_loq, g_dbg_layer, (int)*valueOut, (unsigned)zeros, stream->bitsRead); fdc++; } }
+     return zeros;
+ }
+ 
+diff -ru a/src/enhancement/src/huffman.h b/src/enhancement/src/huffman.h
+--- a/src/enhancement/src/huffman.h	2026-06-16 10:38:48.000000000 -0400
++++ b/src/enhancement/src/huffman.h	2026-08-06 04:17:11.000386756 -0400
+@@ -75,7 +75,7 @@
+  * incrementally, so you can't get a higher value than maxNumSymbols. */
+ typedef struct HuffmanListEntry
+ {
+-    uint8_t code;
++    uint16_t code;
+     uint8_t symbol;
+     uint8_t bits;
+ } HuffmanListEntry;
+diff -ru a/src/pipeline/src/pipeline_base.cpp b/src/pipeline/src/pipeline_base.cpp
+--- a/src/pipeline/src/pipeline_base.cpp	2026-06-16 10:38:48.000000000 -0400
++++ b/src/pipeline/src/pipeline_base.cpp	2026-08-06 13:18:12.717481872 -0400
+@@ -87,6 +87,7 @@
+         bitstreamVersion = static_cast<LdeBitstreamVersion>(builder.configuration().forceBitstreamVersion);
+     }
+     ldeConfigPoolInitialize(m_allocator, m_allocator, &m_configPool, bitstreamVersion);
++    fprintf(stderr, "PIPECREATE %p\n", (void*)this);
+ 
+     ldcTaskPoolInitialize(&m_taskPool, m_allocator, m_allocator, builder.configuration().numThreads,
+                           builder.configuration().numReservedTasks);
+@@ -400,6 +401,8 @@
  {
      assert(timestamp != kInvalidTimestamp);
  
@@ -183,7 +424,7 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
      // Move 'processing' point forwards
      if (m_processingLimit != kInvalidTimestamp &&
          pipeline::compareTimestamps(timestamp, m_processingLimit) < 0) {
-@@ -705,6 +707,10 @@
+@@ -705,6 +708,10 @@
          return nullptr;
      }
  
@@ -194,17 +435,17 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
      // If exceeded reorder limit, or flushing
      if (m_reorderIndex.size() >= m_maxReorder || isProcessing(m_reorderIndex[0])) {
          FrameBase* const frame{m_reorderIndex[0]};
-@@ -728,8 +734,8 @@
+@@ -728,8 +735,8 @@
      // Pull ready frames from reorder table
      while (FrameBase* frame = getNextReordered()) {
          const uint64_t timestamp{frame->timestamp};
-+        fprintf(stderr, "START: ts=%lu\n", timestamp);
++        fprintf(stderr, "START: ts=%lu pipe=%p\n", timestamp, (void*)this);
          bool goodConfig = false;
 -
          if (m_previousTimestamp != kInvalidTimestamp &&
              pipeline::compareTimestamps(m_previousTimestamp, timestamp) > 0) {
              // Frame has been flushed out of reorder queue too late - mark as passthrough
-@@ -750,6 +756,11 @@
+@@ -750,6 +757,11 @@
              ldeConfigPoolFramePassthrough(&m_configPool, &frame->globalConfig, &frame->config);
          }
  
@@ -216,10 +457,27 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
          VNLogDebug(
              "Start Frame: ts:%" PRIx64 " goodConfig:%d temporalEnabled:%d, temporalPresent:%d "
              "temporalRefresh:%d loqEnabled[0]:%d loqEnabled[1]:%d skip:%d flush:%d passthrough:%d",
-diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/tasks_base.cpp /tmp/opencode/lcevc-src/src/pipeline/src/tasks_base.cpp
---- /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src/pipeline/src/tasks_base.cpp	1969-12-31 19:00:01.000000000 -0500
-+++ /tmp/opencode/lcevc-src/src/pipeline/src/tasks_base.cpp	2026-08-05 16:59:55.170326773 -0400
-@@ -467,6 +467,22 @@
+diff -ru a/src/pipeline/src/tasks_base.cpp b/src/pipeline/src/tasks_base.cpp
+--- a/src/pipeline/src/tasks_base.cpp	2026-06-16 10:38:48.000000000 -0400
++++ b/src/pipeline/src/tasks_base.cpp	2026-08-05 21:49:03.906273680 -0400
+@@ -456,6 +456,16 @@
+ 
+     frame->getIntermediatePlaneDesc(data.enhancementTile->plane, data.enhancementTile->loq, ppDesc);
+ 
++    if (data.enhancementTile->loq == LOQ1 && data.enhancementTile->plane == 0) {
++        static int predumpcnt = 0;
++        if (predumpcnt < 8) {
++            predumpcnt++;
++            const int16_t* p = (const int16_t*)ppDesc.firstSample;
++            fprintf(stderr, "L1PRE ts=%llu (0..3)=%d %d %d %d (1,0..3)=%d %d %d %d\n",
++                    (unsigned long long)frame->timestamp, p[0], p[1], p[2], p[3], p[ppDesc.rowByteStride >> 1], p[(ppDesc.rowByteStride >> 1) + 1], p[(ppDesc.rowByteStride >> 1) + 2], p[(ppDesc.rowByteStride >> 1) + 3]);
++        }
++    }
++
+     const bool tuRasterOrder =
+         !frame->globalConfig->temporalEnabled && frame->globalConfig->tileDimensions == TDTNone;
+ 
+@@ -467,6 +477,23 @@
          VNLogError("taskApplyCmdBufferDirect failed");
      }
  
@@ -232,6 +490,7 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
 +            const LdpPictureLayout* lay = frame->getIntermediateLayout(LOQ1);
 +            uint32_t w = lay->width;
 +            uint32_t h = lay->height;
++            fprintf(stderr, "L1DUMP ts=%llu file=%s\n", (unsigned long long)frame->timestamp, fn);
 +            for (uint32_t r = 0; r < h; r++) {
 +                fwrite(ppDesc.firstSample + (size_t)r * ppDesc.rowByteStride, 2, w, f);
 +            }
@@ -242,3 +501,21 @@ diff -ru '--exclude=.git' /nix/store/nn16b937nxpxi43iiwf2zwx6wdvh15yh-source/src
      return nullptr;
  }
  
+@@ -632,6 +659,17 @@
+ 
+     VNLogDebug("taskPassthrough ts:%" PRIx64 " plane:%d", data.frame->timestamp, data.planeIndex);
+ 
++    {
++        static int ptc = 0;
++        if (ptc < 30) {
++            ptc++;
++            const int16_t* sp = (const int16_t*)srcPlane.firstSample;
++            fprintf(stderr, "PTHRU ts=%llu plane=%u (0,0)=%d (0,1)=%d (1,0)=%d\n",
++                    (unsigned long long)frame->timestamp, data.planeIndex, sp[0], sp[1],
++                    sp[srcPlane.rowByteStride >> 1]);
++        }
++    }
++
+     VNDiagInfo(diagInfo, task->name, frame->timestamp, LOQ0, data.planeIndex);
+     if (!ldppPlaneConvert(pipeline->taskPool(), task, data.planeIndex, &frame->basePicture->layout,
+                           &frame->outputPicture->layout, &srcPlane, &dstPlane, VNDiagInfoPtr(diagInfo))) {

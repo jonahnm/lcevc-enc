@@ -359,7 +359,7 @@ impl VvencLib {
         qp: i32,
         colour: Option<&crate::config::ColourInfo>,
     ) -> Result<VvencLib, String> {
-        Self::new_with(width, height, framerate, qp, 1, 10, colour, false)
+        Self::new_with(width, height, framerate, qp, 1, 10, colour, false, "faster")
     }
 
     /// Load libvvenc and create an encoder for the given source picture.
@@ -372,7 +372,20 @@ impl VvencLib {
         refresh_sec: i32,
         colour: Option<&crate::config::ColourInfo>,
     ) -> Result<VvencLib, String> {
-        Self::new_with(width, height, framerate, qp, threads, refresh_sec, colour, true)
+        Self::new_preset(width, height, framerate, qp, threads, refresh_sec, colour, "faster")
+    }
+
+    pub fn new_preset(
+        width: usize,
+        height: usize,
+        framerate: i32,
+        qp: i32,
+        threads: i32,
+        refresh_sec: i32,
+        colour: Option<&crate::config::ColourInfo>,
+        preset: &str,
+    ) -> Result<VvencLib, String> {
+        Self::new_with(width, height, framerate, qp, threads, refresh_sec, colour, true, preset)
     }
 
     fn new_with(
@@ -384,6 +397,7 @@ impl VvencLib {
         refresh_sec: i32,
         colour: Option<&crate::config::ColourInfo>,
         multithread: bool,
+        preset: &str,
     ) -> Result<VvencLib, String> {
         let lib = Box::new(Lib::open()?);
         let mut cfg: Box<VvencConfig> = Box::default();
@@ -424,7 +438,7 @@ impl VvencLib {
             Ok(())
         };
 
-        set_str("preset", "faster")?;
+        set_str("preset", preset)?;
         set_str("threads", &threads.to_string())?;
         if multithread {
             set_str("mtprofile", "3")?;

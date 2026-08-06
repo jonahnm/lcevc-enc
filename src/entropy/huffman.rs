@@ -285,8 +285,16 @@ pub struct HuffmanDecoderTable {
 impl HuffmanDecoderTable {
     /// Parse a table header from the reader.
     pub fn parse(r: &mut BitReader) -> Option<HuffmanDecoderTable> {
+        if std::env::var("LCEVC_DUMP_HT").is_ok() {
+            let mut save = BitReader { data: r.data, pos: r.pos };
+            let raw: Vec<u8> = (0..10).map(|_| save.read_bit().unwrap() as u8).collect();
+            eprintln!("  raw10: {raw:?}");
+        }
         let min_len = r.read_bits(5)? as u8;
         let max_len = r.read_bits(5)? as u8;
+        if std::env::var("LCEVC_DUMP_HT").is_ok() {
+            eprintln!("  HT min={min_len} max={max_len}");
+        }
         if max_len < min_len {
             return None;
         }
@@ -311,6 +319,9 @@ impl HuffmanDecoderTable {
         }
         let length_bits = length_bits_for_range(max_len as u32 - min_len as u32);
         let presence = r.read_bit()?;
+        if std::env::var("LCEVC_DUMP_HT").is_ok() {
+            eprintln!("HT min={min_len} max={max_len} lb={length_bits} presence={presence}");
+        }
         let mut lengths = [0u8; MAX_SYMBOLS];
         if presence {
             for i in 0..256u16 {
@@ -343,6 +354,9 @@ impl HuffmanDecoderTable {
                 if l > max_len || l == 0 {
                     return None;
                 }
+                if std::env::var("LCEVC_DUMP_HT").is_ok() {
+                    eprintln!("  sym={symbol} len={l}");
+                }
                 lengths[symbol] = l;
             }
         }
@@ -370,6 +384,12 @@ impl HuffmanDecoderTable {
             curr_code += 1;
         }
 
+        if std::env::var("LCEVC_DUMP_HT").is_ok() {
+            eprintln!("  codes:");
+            for (l, sym, code) in entries.iter().take(12) {
+                eprintln!("    sym={sym} len={l} code={code:04x}");
+            }
+        }
         Some(HuffmanDecoderTable {
             entries,
             min_len,

@@ -315,6 +315,16 @@ pub fn decode_coefficient_chunk(data: &[u8], rle_only: bool, total_positions: us
         tables[LSB] = HuffmanDecoderTable::parse(&mut r);
         tables[MSB] = HuffmanDecoderTable::parse(&mut r);
         tables[RL] = HuffmanDecoderTable::parse(&mut r);
+        if std::env::var("LCEVC_DUMP_FULLRL").is_ok() {
+            if let Some(rl) = &tables[RL] {
+                if !rl.empty {
+                    eprintln!("  FRL min={} max={} n={}", rl.min_len, rl.max_len, rl.entries.len());
+                    for (len, sym, code) in rl.entries.iter() {
+                        eprintln!("    sym={:02x} len={} code={:03x}", sym, len, code);
+                    }
+                }
+            }
+        }
         if tables.iter().any(|t| t.is_none()) {
             return Vec::new();
         }
@@ -346,6 +356,15 @@ pub fn decode_coefficient_chunk(data: &[u8], rle_only: bool, total_positions: us
             Some(s) => s,
             None => break,
         };
+        if std::env::var("LCEVC_DUMP_SYM").is_ok() {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SYMCNT: AtomicU32 = AtomicU32::new(0);
+            let sc = SYMCNT.fetch_add(1, Ordering::Relaxed);
+            let f = std::env::var("LCEVC_RSYM_FRAME").unwrap_or_default();
+            if sc < 60000 {
+                eprintln!("RSYM {sc} f={f} st={} s={sym:02x}", state as usize);
+            }
+        }
         match state {
             LSB => {
                 let msb_flag = sym & 0x01;

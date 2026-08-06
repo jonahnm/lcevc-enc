@@ -18,7 +18,7 @@
 
 use crate::config::{LcevcConfig, ScalingMode};
 use crate::dequant::{self, DequantTable, TemporalSignal};
-use crate::entropy::rle::{write_coefficient_chunk, CoeffEvent, TemporalRun};
+use crate::entropy::rle::{write_coefficient_chunk, decode_coefficient_chunk, CoeffEvent, TemporalRun};
 use crate::frame::{Plane, PlaneS16, Picture};
 use crate::transform::{ForwardTransform, residual_index};
 use crate::upscale::{downscale_plane, upscale_plane};
@@ -50,6 +50,8 @@ pub struct EncodedFrame {
     pub base_picture: Picture,
     /// Total encoded enhancement bytes for this frame (payloads only).
     pub byte_count: usize,
+    /// SSE of the base-only prediction vs the source (difficulty proxy).
+    pub base_only_sse: u64,
 }
 
 /// Accumulated statistics.
@@ -315,6 +317,15 @@ fn encode_tu_residual(
         coeffs[l] = quantize(nums[l], denom, layer.step_width as i32, -(layer.offset as i32));
     }
 
+    if std::env::var("LCEVC_DUMP_C").is_ok() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CNT: AtomicU32 = AtomicU32::new(0);
+        let n = CNT.fetch_add(1, Ordering::Relaxed);
+        if n < 24 {
+            eprintln!("ENC_C s={} t={:?}: {:?}", n, signal, &coeffs[..num_layers]);
+        }
+    }
+
     // RDOQ: refine each level with a rate-distortion cost. The transform is
     // Hadamard-based (orthogonal up to a constant absorbed in the lambda), so
     // the pixel SSE of a level change is (dequant(q) - orig)^2 times a
@@ -336,7 +347,13 @@ fn encode_tu_residual(
             let num = nums[l] as i64;
             // Lambda ~ sw^2 tuned empirically (0.0625 absorbs the transform
             // orthogonality constant); a bit is worth ~ sw/2 of error.
-            let lambda_q = (sw * sw) / 16;
+            // The LCEVC_RDOQ_LAMBDA_DIV env var scales the rate penalty
+            // (larger divisor = weaker penalty = more coefficients kept).
+            let mut lambda_div: i64 = 16;
+            if let Ok(v) = std::env::var("LCEVC_RDOQ_LAMBDA_DIV") {
+                lambda_div = v.parse().unwrap_or(16);
+            }
+            let lambda_q = (sw * sw) / lambda_div;
             // Fast path: with a zero level the zero cost is num^2 and any
             // nonzero candidate costs at least lambda*bits (9 for a 1-byte
             // value), so zero provably wins when num^2 <= lambda*9*d2.
@@ -424,6 +441,26 @@ fn encode_tu_residual(
                 .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         }
         rec_residual = filtered;
+    }
+
+    // Per-TU adaptive residual: if the quantized residual does not improve
+    // the prediction in pixel SSE, drop the whole TU. This keeps every
+    // transmitted TU beneficial, so the frame-level adaptive drop below only
+    // fires when the entire frame's residual is harmful.
+    if coeffs.iter().any(|&c| c != 0) {
+        let mut sse_pred: i64 = 0;
+        let mut sse_recon: i64 = 0;
+        for i in 0..residual.len() {
+            let r = residual[i] as i64;
+            let rr = rec_residual[i] as i64;
+            sse_pred += r * r;
+            let d = r - rr;
+            sse_recon += d * d;
+        }
+        if sse_recon >= sse_pred {
+            coeffs = [0; 16];
+            rec_residual = [0; 16];
+        }
     }
 
     (coeffs, rec_residual)
@@ -538,6 +575,7 @@ fn process_plane(
     qm: &[Vec<u8>; 2],
     mut tb: PlaneS16,
     plane: usize,
+    frame_idx: u32,
     rdoq: bool,
 ) -> Result<PlaneResult, String> {
     let mut chunks_l1: u64 = 0;
@@ -579,6 +617,14 @@ fn process_plane(
                             cfg.level1_filtering_second_coefficient,
                             energy, rdoq,
                         );
+                        if plane == 0 {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static TCNT1: AtomicU32 = AtomicU32::new(0);
+                            let tn = TCNT1.fetch_add(1, Ordering::Relaxed);
+                            if std::env::var("LCEVC_DUMP_TURES").is_ok() && coeffs.iter().any(|&c| c != 0) {
+                                eprintln!("ENC1TU f={frame_idx} x={x} y={y} c={:?} r={:?}", coeffs, &residual[..tu_size*tu_size]);
+                            }
+                        }
                         for l in 0..num_layers {
                             push_coeff(&mut events[l], &mut runs[l], coeffs[l]);
                         }
@@ -619,6 +665,28 @@ fn process_plane(
 
             // ---- LOQ0 (L2) ----
             let l2_pred = upscale_plane(&l1_recon, cfg.scaling_l2, &kernel, apply_pa);
+            if plane == 0 && (std::env::var("LCEVC_DUMP_L1").is_ok() || std::env::var("LCEVC_DUMP_PRED").is_ok()) {
+                use std::io::Write;
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static PCNT: AtomicU32 = AtomicU32::new(0);
+                let pn = PCNT.fetch_add(1, Ordering::Relaxed);
+                if pn < 8 {
+                    eprintln!("L1PRED p={} (0,0)={} (0,1)={} (1,0)={}", pn, l1_pred.data[0], l1_pred.data[1], l1_pred.data[l1_pred.width]);
+                }
+            }
+            if plane == 0 && std::env::var("LCEVC_DUMP_L1").is_ok() {
+                use std::io::Write;
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static CNT: AtomicU32 = AtomicU32::new(0);
+                let fname = format!("/tmp/opencode/l1_recon_{:03}.yuv", CNT.fetch_add(1, Ordering::Relaxed));
+                let mut f = std::fs::File::create(&fname).unwrap();
+                for row in 0..l1_recon.height {
+                    for x in 0..l1_recon.width {
+                        let v = l1_recon.data[row * l1_recon.width + x];
+                        f.write_all(&(v as u16).to_le_bytes()).unwrap();
+                    }
+                }
+            }
             let src_s16 = source.planes[plane].to_s16(cfg.sample_depth());
             let mut l2_recon = l2_pred.clone();
             {
@@ -654,6 +722,7 @@ fn process_plane(
             }
 
             if !temporal_enabled && !cfg.is_tiled() {
+                eprintln!("L2BRANCH rows-path");
                 let tus_x = src_s16.width / tu_size;
                 let tus_y = src_s16.height / tu_size;
                 let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -663,6 +732,14 @@ fn process_plane(
                         let (coeffs, residual) = encode_tu(
                             &src_s16, &l2_pred, &table_inter, &forward0, tu_size, x, y,
                             TemporalSignal::Inter, false, 0, 0, energy, rdoq);
+                        if plane == 0 {
+                            use std::sync::atomic::{AtomicU32, Ordering};
+                            static TCNT: AtomicU32 = AtomicU32::new(0);
+                            let tn = TCNT.fetch_add(1, Ordering::Relaxed);
+                            if std::env::var("LCEVC_DUMP_TURES").is_ok() && coeffs.iter().any(|&c| c != 0) {
+                                eprintln!("ENCTU f={frame_idx} x={x} y={y} c={:?} r={:?}", coeffs, &residual[..tu_size*tu_size]);
+                            }
+                        }
                         for l in 0..num_layers {
                             push_coeff(&mut events[l], &mut runs[l], coeffs[l]);
                         }
@@ -832,6 +909,29 @@ fn process_plane(
                             tiles.push(Chunk { entropy_enabled: false, rle_only: false, data: Vec::new() });
                         } else {
                             let cd = write_coefficient_chunk(events);
+                            if std::env::var("LCEVC_DUMP_C").is_ok() && plane == 0 && loq_idx == 0 && layer < 16 {
+                                use std::sync::atomic::{AtomicU32, Ordering};
+                                static CNT2: AtomicU32 = AtomicU32::new(0);
+                                let n = CNT2.fetch_add(1, Ordering::Relaxed);
+                                if n < 60 {
+                                    unsafe { std::env::set_var("LCEVC_RSYM_FRAME", frame_idx.to_string()); }
+                                    let ev: Vec<(i16, u32)> = events.iter().map(|e| (e.value, e.zero_run)).collect();
+                                    let back = decode_coefficient_chunk(&cd, false, usize::MAX);
+                                    eprintln!("CHUNK frame={frame_idx} n={n} bytes={:?}", &cd[..cd.len().min(16)]);
+                                    eprintln!("  events({}): {:?}", ev.len(), &ev[..ev.len().min(6)]);
+                                }
+                            }
+                            if plane == 0 && loq_idx == 1 && layer < 4 {
+                                let ev: Vec<(i16, u32)> = events.iter().map(|e| (e.value, e.zero_run)).collect();
+                                let back = decode_coefficient_chunk(&cd, false, usize::MAX);
+                                eprintln!("L2CHUNK frame={frame_idx} layer={layer} bytes={:?} events({}): {:?}", &cd[..cd.len().min(16)], ev.len(), &ev[..ev.len().min(6)]);
+                                eprintln!("  back({}): {:?}", back.len(), &back[..back.len().min(6)]);
+                                if std::env::var("LCEVC_DUMP_FULLBACK").is_ok() && layer == 0 {
+                                    for (i, e) in back.iter().enumerate() {
+                                        eprintln!("MB {} {} {}", i, e.value, e.zero_run);
+                                    }
+                                }
+                            }
                             if plane == 0 && loq_idx == 1 && layer == 1 {
                             }
                             tiles.push(Chunk {
@@ -952,10 +1052,12 @@ impl Encoder {
             // drop/overshoot oscillation.
             0.9
         } else {
-            // Damped interpolation (size ~ C/sw^2): a tighter clamp keeps
-            // the step widths stable frame to frame so the adaptive drop
-            // does not oscillate; the target is tracked over a few frames.
-            (self.rc_prev_size as f64 / t).powf(0.5).clamp(0.8, 1.25)
+            // Size ~ C/sw^2, so the exact one-step correction is
+            // k = sqrt(prev/t). Allow a wide per-frame step so the
+            // bitrate converges within a few frames from any start;
+            // the next frame's size then reflects the new width, which
+            // dampens any overshoot naturally.
+            (self.rc_prev_size as f64 / t).powf(0.5).clamp(0.7, 4.0)
         };
         let sw1 = ((self.rc_prev_sw1 as f64) * k).round().clamp(16.0, 16384.0) as u32;
         let sw2 = ((self.rc_prev_sw2 as f64) * k).round().clamp(1.0, 4096.0) as u32;
@@ -1030,6 +1132,7 @@ impl Encoder {
         let tb_start = if cfg.temporal_enabled { self.temporal_buffers.clone() } else { Vec::new() };
 
         let quant_matrix = self.quant_matrix.clone();
+        let frame_idx_now = self.frame_index;
         let tbs = std::mem::take(&mut self.temporal_buffers);
         let plane_results: Vec<PlaneResult> = std::thread::scope(|s| -> Result<Vec<PlaneResult>, String> {
             let handles: Vec<_> = tbs
@@ -1046,7 +1149,7 @@ impl Encoder {
                         process_plane(
                             cfg, source, base_picture, l1_targets, kernel, apply_pa,
                             temporal_refresh, temporal_signalling, tu_size, num_layers,
-                            tu_order, sw_l1, sw_l2, qm, tb, plane, rdoq,
+                            tu_order, sw_l1, sw_l2, qm, tb, plane, frame_idx_now, rdoq,
                         )
                     })
                 })
@@ -1069,6 +1172,35 @@ impl Encoder {
             }
             self.stats.l1_chunks += r.chunks_l1;
             self.stats.l2_chunks += r.chunks_l2;
+        }
+
+        // Dump the full 4K reconstruction (L2) per frame for reference comparison.
+        if std::env::var("LCEVC_DUMP_RECON").is_ok() {
+            use std::io::Write;
+            let fname = format!("/tmp/opencode/enc_recon_{:03}.yuv", frame_idx_now);
+            let mut f = std::fs::File::create(&fname).unwrap();
+            for p in 0..output.planes.len() {
+                let (pw, ph) = cfg.plane_dimensions(0, p);
+                let plane = &output.planes[p];
+                for y in 0..ph as usize {
+                    for x in 0..pw as usize {
+                        let v: i32 = plane.data[y * plane.width + x].into();
+                        let cv = if cfg.sample_depth() == 8 { v.clamp(0, 255) << 2 } else { v.clamp(0, 1023) };
+                        f.write_all(&(cv as u16).to_le_bytes()).unwrap();
+                    }
+                }
+            }
+            eprintln!("RECON frame={frame_idx_now} -> {fname}");
+        }
+
+        // Dump the decoded base picture (pre-upscale) for reference comparison.
+        if std::env::var("LCEVC_DUMP_BASE").is_ok() {
+            use std::io::Write;
+            let fname = format!("/tmp/opencode/enc_base_{:03}.yuv", frame_idx_now);
+            let mut f = std::fs::File::create(&fname).unwrap();
+            crate::base::write_yuv420(base_picture, cfg.sample_depth(), &mut f)
+                .map_err(|e| e.to_string())?;
+            eprintln!("BASE frame={frame_idx_now} -> {fname}");
         }
 
         // Adaptive enhancement: if the residual does not improve the
@@ -1138,6 +1270,7 @@ impl Encoder {
             output,
             base_picture: base_picture.clone(),
             byte_count,
+            base_only_sse,
         })
     }
 

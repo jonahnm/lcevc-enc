@@ -102,6 +102,11 @@ pub enum UpsampleType {
     Linear,
     Cubic,
     ModifiedCubic,
+    /// Adaptive (signalled) 4-tap kernel, spec 8.6.7: the kernel taps are
+    /// carried in the global config so the decoder uses exactly the encoder's
+    /// filter. Tap order is the decoder's `kKernels` order {k0, k1, k2, k3}
+    /// with the restriction that k0 and k3 are negative.
+    Adaptive { taps: [i16; 4] },
 }
 
 impl UpsampleType {
@@ -111,6 +116,7 @@ impl UpsampleType {
             UpsampleType::Linear => 1,
             UpsampleType::Cubic => 2,
             UpsampleType::ModifiedCubic => 3,
+            UpsampleType::Adaptive { .. } => 4,
         }
     }
     /// Kernel taps: {k0, k1, k2, k3} as in the decoder's `kKernels`.
@@ -120,6 +126,9 @@ impl UpsampleType {
             UpsampleType::Linear => [0, 12288, 4096, 0],
             UpsampleType::Cubic => [-1382, 14285, 3942, -461],
             UpsampleType::ModifiedCubic => [-2360, 15855, 4165, -1276],
+            // 4-tap Lanczos-2 sampled at the half-pixel phase, scaled to
+            // 16384 and rounded (default; the signalled taps override).
+            UpsampleType::Adaptive { taps } => taps,
         }
     }
 }
@@ -514,6 +523,15 @@ impl LcevcConfig {
         // temporal_step_width_modifier.
         if self.temporal_step_width_modifier != 48 {
             w.write_byte(self.temporal_step_width_modifier);
+        }
+
+        // Adaptive (signalled) upsampler kernel, spec 8.6.7: four u16
+        // magnitudes; the decoder negates taps 0 and 3.
+        if let UpsampleType::Adaptive { taps } = self.upsampler {
+            for (i, &t) in taps.iter().enumerate() {
+                let mag = if i % 3 == 0 { -t as i32 } else { t as i32 };
+                w.write_u16(mag.clamp(0, u16::MAX as i32) as u16);
+            }
         }
 
         // level1 filtering coefficients.
