@@ -39,7 +39,7 @@ cargo build --release
 
 Decodes any ffmpeg-readable input, pipes it through `yuv4mpegpipe`
 (8-bit or 10-bit HDR is preserved), encodes with a VVC base at QP 24
-(half-res pyramid, 2x2 transform, signalled Lanczos-2 upsampler kernel,
+(half-res pyramid, 4x4 transform, signalled Lanczos-2 upsampler kernel,
 per-TU adaptive residual, RDOQ lambda 4, difficulty-weighted rate control)
 and muxes a dual-track MP4:
 

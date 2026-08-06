@@ -447,7 +447,8 @@ fn encode_tu_residual(
     // the prediction in pixel SSE, drop the whole TU. This keeps every
     // transmitted TU beneficial, so the frame-level adaptive drop below only
     // fires when the entire frame's residual is harmful.
-    if coeffs.iter().any(|&c| c != 0) {
+    let per_tu_enabled = std::env::var("LCEVC_DISABLE_PERTU").is_err();
+    if per_tu_enabled && coeffs.iter().any(|&c| c != 0) {
         let mut sse_pred: i64 = 0;
         let mut sse_recon: i64 = 0;
         for i in 0..residual.len() {

@@ -18,7 +18,7 @@ rem   --target-kbps N       rate-control the enhancement toward N kbps
 rem   --keyframe-interval N keyframe (GOP) interval in seconds
 rem   --gop N               GOP size in frames (overrides --keyframe-interval)
 rem   --scale WxH           downscale the video before encoding
-rem   --transform 2x2|4x4   residual transform (default 2x2)
+rem   --transform 2x2|4x4   residual transform (default 4x4, faster)
 rem   --upsampler MODE [K0,K1,K2,K3]
 rem                         nearest|bilinear|cubic|modified-cubic|adaptive
 rem                         (adaptive signals a custom 4-tap kernel, e.g.
@@ -65,7 +65,7 @@ set "KEYFRAME="
 set "GOP="
 set "SCALE="
 set "BASE_SCALE=2"
-set "TRANSFORM=2x2"
+set "TRANSFORM=4x4"
 set "UPSAMPLER=--upsampler adaptive -1023,9214,9214,-1023"
 set "LAMBDA_DIV=4"
 set "PRESET=faster"

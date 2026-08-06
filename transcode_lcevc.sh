@@ -23,7 +23,9 @@
 #                         for an 8K source; an 8K encode is ~4x slower)
 #   --base-scale N        base downscale factor per dimension: 2 = half-res
 #                         (default), 4 = quarter-res, 1 = full-res base
-#   --transform 2x2|4x4   residual transform: 2x2 (DD, 4 layers, default) or
+#   --transform 2x2|4x4   residual transform: 4x4 (DDS, 16 layers,
+#                         default, faster) or 2x2 (DD, 4 layers, slightly
+#                         better quality at low bitrates)
 #                         4x4 (DDS, 16 layers). 2x2 is more efficient at
 #                         low bitrates.
 #   --upsampler MODE [K0,K1,K2,K3]
@@ -91,7 +93,7 @@ KEYFRAME=""
 GOP=""
 SCALE=""
 BASE_SCALE=2
-TRANSFORM="2x2"
+TRANSFORM="4x4"
 UPSAMPLER_ARGS=(--upsampler adaptive -1023,9214,9214,-1023)
 LAMBDA_DIV=4
 PRESET="faster"
