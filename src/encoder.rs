@@ -300,9 +300,36 @@ fn encode_tu_residual(
 ) -> ([i16; 16], [i16; 16]) {
     let tu_size = (residual.len() as f64).sqrt() as usize;
     let _ = (deblock, deblock_corner, deblock_side, tu_size);
+    let num_layers = forward.layers();
+
+    // Early exit: for the Hadamard transforms here every coefficient
+    // satisfies |c| = |num|/denom <= max|r|, and a coefficient is nonzero
+    // only when |c| >= step/2 + offset. If the residual cannot reach that
+    // threshold in any layer, the whole TU is provably zero - skip the
+    // transform, RDOQ and inverse entirely. This is the hot path for
+    // smooth content, where most TUs carry no signal.
+    let mut max_r: i32 = 0;
+    for &v in residual {
+        let a = (v as i32).abs();
+        if a > max_r {
+            max_r = a;
+        }
+    }
+    if max_r > 0 {
+        let mut min_thresh: i32 = i32::MAX;
+        for l in 0..num_layers {
+            let layer = &table.layers[signal as usize][l];
+            let t = (layer.step_width as i32) / 2 + layer.offset as i32;
+            if t < min_thresh {
+                min_thresh = t;
+            }
+        }
+        if (max_r as i64) < (min_thresh as i64) {
+            return ([0; 16], [0; 16]);
+        }
+    }
 
     let (nums, denom) = forward.apply(residual);
-    let num_layers = forward.layers();
     for l in 0..num_layers {
         if let Some(e) = energy.get_mut(l) {
             let c = nums[l] as f64 / denom as f64;
@@ -698,6 +725,8 @@ fn process_plane(
                 }
             }
             let src_s16 = source.planes[plane].to_s16(cfg.sample_depth());
+            let prof = std::env::var("LCEVC_PROF").is_ok();
+            let t_up2 = std::time::Instant::now();
             let mut l2_recon = l2_pred.clone();
             {
                 // Base-only prediction: the pure base upscaled (no residual).
@@ -707,6 +736,10 @@ fn process_plane(
                 let sse = crate::simd::sse_diff_u16(&source.planes[plane].data, &base_only_plane.data);
                 base_only_sse += sse;
                 base_only.push(base_only_plane);
+            }
+            let t_up2e = std::time::Instant::now();
+            if prof && plane == 0 {
+                eprintln!("PROF p{plane}: l2pred+base_only upscale={:?}", t_up2e.duration_since(t_up2));
             }
 
             let temporal_enabled = cfg.temporal_enabled;
@@ -1121,11 +1154,14 @@ impl Encoder {
         let nplanes = cfg.num_planes();
 
         // Reference pyramid: LOQ0 (source), LOQ1 (L1 target).
+        let prof = std::env::var("LCEVC_PROF").is_ok();
+        let t_frame = std::time::Instant::now();
         let mut l1_targets: Vec<Plane> = Vec::with_capacity(nplanes);
         for p in 0..nplanes {
             let l1_target = downscale_plane(&source.planes[p], cfg.scaling_l2, cfg.sample_depth());
             l1_targets.push(l1_target);
         }
+        let t_down = std::time::Instant::now();
 
         // Per-plane state.
         let mut residual_chunks: Vec<Vec<Vec<Vec<Chunk>>>> = Vec::new();
@@ -1184,6 +1220,14 @@ impl Encoder {
             }
             self.stats.l1_chunks += r.chunks_l1;
             self.stats.l2_chunks += r.chunks_l2;
+        }
+        let t_planes = std::time::Instant::now();
+        if prof {
+            eprintln!(
+                "PROF frame={frame_idx_now} downscale={:?} planes+TU={:?}",
+                t_down.duration_since(t_frame),
+                t_planes.duration_since(t_down)
+            );
         }
 
         // Dump the full 4K reconstruction (L2) per frame for reference comparison.
