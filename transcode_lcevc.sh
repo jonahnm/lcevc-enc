@@ -53,9 +53,10 @@
 # --temporal on --temporal-sw-modifier 24 or removing --no-rdoq.
 #
 # The default encode is tuned for ~7 Mbps 4K30: VVC base QP 24 at 1080p,
-# 2x2 transform, signalled Lanczos-2 upsampler kernel, per-TU adaptive
-# residual and RDOQ lambda 4, with difficulty-weighted rate control toward
-# the total budget.
+# 4x4 transform, signalled Lanczos-2 upsampler kernel, L1 residual disabled
+# (SW1 = 32767, matching the LTM 8.1 reference operating points in comp.pdf),
+# per-TU adaptive residual and RDOQ lambda 4, with difficulty-weighted rate
+# control toward the total budget.
 #
 # Environment:
 #   LCEVC_ENC   path to the lcevc_enc binary (default: target/release)
@@ -300,7 +301,7 @@ set -o pipefail
         --transform "$TRANSFORM" \
         "${UPSAMPLER_ARGS[@]}" \
         --qm-beta 0.3 \
-        --step-width-l1 2000 --step-width-l2 1000 \
+        --step-width-l1 32767 --step-width-l2 1000 \
         --no-psnr \
         "${FRAMES_ARG[@]}" \
         "${GOP_ARGS[@]}" \
