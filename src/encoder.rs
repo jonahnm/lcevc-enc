@@ -339,6 +339,17 @@ fn encode_tu_residual(
     if rdoq && table.layers[signal as usize][0].step_width > 0 {
         let denom_i = denom as i64;
         let d2 = (denom_i * denom_i) as u64;
+        // The LCEVC_RDOQ_LAMBDA_DIV env var scales the rate penalty
+        // (larger divisor = weaker penalty = more coefficients kept).
+        // Read once: std::env::var is expensive on Windows and this is the
+        // per-TU hot path.
+        static LAMBDA_DIV: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        let lambda_div: i64 = *LAMBDA_DIV.get_or_init(|| {
+            std::env::var("LCEVC_RDOQ_LAMBDA_DIV")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(16)
+        });
         for l in 0..num_layers {
             let layer = &table.layers[signal as usize][l];
             let sw = layer.step_width as i64;
@@ -347,12 +358,6 @@ fn encode_tu_residual(
             let num = nums[l] as i64;
             // Lambda ~ sw^2 tuned empirically (0.0625 absorbs the transform
             // orthogonality constant); a bit is worth ~ sw/2 of error.
-            // The LCEVC_RDOQ_LAMBDA_DIV env var scales the rate penalty
-            // (larger divisor = weaker penalty = more coefficients kept).
-            let mut lambda_div: i64 = 16;
-            if let Ok(v) = std::env::var("LCEVC_RDOQ_LAMBDA_DIV") {
-                lambda_div = v.parse().unwrap_or(16);
-            }
             let lambda_q = (sw * sw) / lambda_div;
             // Fast path: with a zero level the zero cost is num^2 and any
             // nonzero candidate costs at least lambda*bits (9 for a 1-byte
@@ -446,8 +451,10 @@ fn encode_tu_residual(
     // Per-TU adaptive residual: if the quantized residual does not improve
     // the prediction in pixel SSE, drop the whole TU. This keeps every
     // transmitted TU beneficial, so the frame-level adaptive drop below only
-    // fires when the entire frame's residual is harmful.
-    let per_tu_enabled = std::env::var("LCEVC_DISABLE_PERTU").is_err();
+    // fires when the entire frame's residual is harmful. Read the env gate
+    // once (this is the per-TU hot path; std::env::var is slow on Windows).
+    static PERTU_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let per_tu_enabled = *PERTU_ENABLED.get_or_init(|| std::env::var("LCEVC_DISABLE_PERTU").is_err());
     if per_tu_enabled && coeffs.iter().any(|&c| c != 0) {
         let mut sse_pred: i64 = 0;
         let mut sse_recon: i64 = 0;
@@ -621,8 +628,10 @@ fn process_plane(
                         if plane == 0 {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static TCNT1: AtomicU32 = AtomicU32::new(0);
+                            static DUMP_TURES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                            let dump_tures = *DUMP_TURES.get_or_init(|| std::env::var("LCEVC_DUMP_TURES").is_ok());
                             let tn = TCNT1.fetch_add(1, Ordering::Relaxed);
-                            if std::env::var("LCEVC_DUMP_TURES").is_ok() && coeffs.iter().any(|&c| c != 0) {
+                            if dump_tures && coeffs.iter().any(|&c| c != 0) {
                                 eprintln!("ENC1TU f={frame_idx} x={x} y={y} c={:?} r={:?}", coeffs, &residual[..tu_size*tu_size]);
                             }
                         }
@@ -738,8 +747,10 @@ fn process_plane(
                         if plane == 0 {
                             use std::sync::atomic::{AtomicU32, Ordering};
                             static TCNT: AtomicU32 = AtomicU32::new(0);
+                            static DUMP_TURES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                            let dump_tures = *DUMP_TURES.get_or_init(|| std::env::var("LCEVC_DUMP_TURES").is_ok());
                             let tn = TCNT.fetch_add(1, Ordering::Relaxed);
-                            if std::env::var("LCEVC_DUMP_TURES").is_ok() && coeffs.iter().any(|&c| c != 0) {
+                            if dump_tures && coeffs.iter().any(|&c| c != 0) {
                                 eprintln!("ENCTU f={frame_idx} x={x} y={y} c={:?} r={:?}", coeffs, &residual[..tu_size*tu_size]);
                             }
                         }
