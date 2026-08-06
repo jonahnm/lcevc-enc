@@ -722,7 +722,9 @@ fn process_plane(
             }
 
             if !temporal_enabled && !cfg.is_tiled() {
-                eprintln!("L2BRANCH rows-path");
+                if std::env::var("LCEVC_DUMP_BRANCH").is_ok() {
+                    eprintln!("L2BRANCH rows-path");
+                }
                 let tus_x = src_s16.width / tu_size;
                 let tus_y = src_s16.height / tu_size;
                 let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -921,7 +923,7 @@ fn process_plane(
                                     eprintln!("  events({}): {:?}", ev.len(), &ev[..ev.len().min(6)]);
                                 }
                             }
-                            if plane == 0 && loq_idx == 1 && layer < 4 {
+                            if std::env::var("LCEVC_DUMP_C").is_ok() && plane == 0 && loq_idx == 1 && layer < 4 {
                                 let ev: Vec<(i16, u32)> = events.iter().map(|e| (e.value, e.zero_run)).collect();
                                 let back = decode_coefficient_chunk(&cd, false, usize::MAX);
                                 eprintln!("L2CHUNK frame={frame_idx} layer={layer} bytes={:?} events({}): {:?}", &cd[..cd.len().min(16)], ev.len(), &ev[..ev.len().min(6)]);
@@ -931,8 +933,6 @@ fn process_plane(
                                         eprintln!("MB {} {} {}", i, e.value, e.zero_run);
                                     }
                                 }
-                            }
-                            if plane == 0 && loq_idx == 1 && layer == 1 {
                             }
                             tiles.push(Chunk {
                                 entropy_enabled: true,

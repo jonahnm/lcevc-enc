@@ -236,7 +236,6 @@ del /q "%TEMP%\lcevc_frames.txt" "%TEMP%\lcevc_dur.txt" "%TEMP%\lcevc_fps.txt" 2
 
 echo == frames: dur=!DUR! fps=!FPS! fnum=!FNUM! fden=!FDEN! total=!TOTAL_FRAMES!
 
-echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, !BASE_SCALE!x base downscale, !TOTAL_FRAMES! frames^)
 
 rem Default total-bitrate budget: ~0.84 bpp scaled so 4K caps at 7 Mbps
 rem TOTAL (VVC base + enhancement); the encoder measures the base's
