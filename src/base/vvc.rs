@@ -57,8 +57,12 @@ impl VvcStreamer {
         let pad_w = (bw + 15) / 16 * 16;
         let pad_h = (bh + 15) / 16 * 16;
         let ncpu = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        // The vvenc base encoder runs concurrently with the enhancement TU
+        // threads (the pipeline stays a GOP ahead), so cap it at half the
+        // machine to avoid oversubscription on many-core boxes.
+        let vvenc_threads = (ncpu / 2).max(1);
         let mut lib = crate::base::vvenc_lib::VvencLib::new_preset(
-            pad_w, pad_h, 25, qp, ncpu as i32, refresh_sec.max(1) as i32, cfg.colour.as_ref(),
+            pad_w, pad_h, 25, qp, vvenc_threads as i32, refresh_sec.max(1) as i32, cfg.colour.as_ref(),
             preset,
         )?;
 

@@ -735,6 +735,8 @@ fn run(args: &[String]) -> Result<(), String> {
             }
             match streamer.recv_frame()? {
                 Some(base) => {
+                    let prof = std::env::var("LCEVC_PROF").is_ok();
+                    let t_recv = std::time::Instant::now();
                     if let Some(frame) = queue.pop_front() {
                 let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
                 let tb = tb_for(base_size, sent).map(|t| weighted_tb(t, rc_sse_prev, &mut rc_sse_avg, &mut rc_w_avg));
@@ -746,6 +748,10 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     None => encoder.encode_frame_with_base(&frame, &base)?,
                 };
+                let t_enc = std::time::Instant::now();
+                if prof {
+                    eprintln!("PROF recv_wait={:?} encode={:?}", t_recv.elapsed(), t_enc.duration_since(frame_start));
+                }
                 rc_sse_prev = encoded.base_only_sse;
                 if rc_sse_avg == 0.0 {
                     rc_sse_avg = rc_sse_prev as f64;
@@ -783,6 +789,8 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         while let Some(base) = streamer.recv_frame()? {
             if let Some(frame) = queue.pop_front() {
+                let prof = std::env::var("LCEVC_PROF").is_ok();
+                let t_recv = std::time::Instant::now();
                 let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
                 let tb = tb_for(base_size, sent).map(|t| weighted_tb(t, rc_sse_prev, &mut rc_sse_avg, &mut rc_w_avg));
                 let frame_start = std::time::Instant::now();
@@ -793,6 +801,9 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     None => encoder.encode_frame_with_base(&frame, &base)?,
                 };
+                if prof {
+                    eprintln!("PROF flush recv_wait={:?} encode={:?}", t_recv.elapsed(), frame_start.elapsed());
+                }
                 rc_sse_prev = encoded.base_only_sse;
                 if rc_sse_avg == 0.0 {
                     rc_sse_avg = rc_sse_prev as f64;
