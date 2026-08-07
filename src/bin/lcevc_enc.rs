@@ -161,6 +161,9 @@ fn process_gop(
 }
 
 fn main() {
+    if std::env::var("LCEVC_PROF").is_ok() {
+        eprintln!("PROF: instrumentation active (build {}", env!("CARGO_PKG_VERSION"),);
+    }
     let args: Vec<String> = std::env::args().collect();
     if let Err(e) = run(&args) {
         eprintln!("error: {e}");
