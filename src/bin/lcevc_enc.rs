@@ -716,8 +716,12 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         loop {
             if !eof {
+                let t_src = std::time::Instant::now();
                 match read_next(&mut frame_source, width, height, bit_depth, &mut verify_frames, verify)? {
                     Some(f) => {
+                        if std::env::var("LCEVC_PROF").is_ok() {
+                            eprintln!("PROF source_read={:?}", t_src.elapsed());
+                        }
                         if let Some(p) = streamer.send_frame(&f, cfg.scaling_l1, cfg.scaling_l2)? {
                             au_pocs.push_back(p);
                         }
@@ -740,6 +744,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     if let Some(frame) = queue.pop_front() {
                 let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
                 let tb = tb_for(base_size, sent).map(|t| weighted_tb(t, rc_sse_prev, &mut rc_sse_avg, &mut rc_w_avg));
+                let t_wait = t_recv.elapsed();
                 let frame_start = std::time::Instant::now();
                 let encoded = match tb {
                     Some(tb) => {
@@ -748,9 +753,8 @@ fn run(args: &[String]) -> Result<(), String> {
                     }
                     None => encoder.encode_frame_with_base(&frame, &base)?,
                 };
-                let t_enc = std::time::Instant::now();
                 if prof {
-                    eprintln!("PROF recv_wait={:?} encode={:?}", t_recv.elapsed(), t_enc.duration_since(frame_start));
+                    eprintln!("PROF main base_wait={:?} encode={:?}", t_wait, frame_start.elapsed());
                 }
                 rc_sse_prev = encoded.base_only_sse;
                 if rc_sse_avg == 0.0 {
@@ -793,6 +797,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 let t_recv = std::time::Instant::now();
                 let base_size = std::fs::metadata(&base_out_path).map(|m| m.len()).unwrap_or(0);
                 let tb = tb_for(base_size, sent).map(|t| weighted_tb(t, rc_sse_prev, &mut rc_sse_avg, &mut rc_w_avg));
+                let t_wait = t_recv.elapsed();
                 let frame_start = std::time::Instant::now();
                 let encoded = match tb {
                     Some(tb) => {
@@ -802,7 +807,7 @@ fn run(args: &[String]) -> Result<(), String> {
                     None => encoder.encode_frame_with_base(&frame, &base)?,
                 };
                 if prof {
-                    eprintln!("PROF flush recv_wait={:?} encode={:?}", t_recv.elapsed(), frame_start.elapsed());
+                    eprintln!("PROF flush base_wait={:?} encode={:?}", t_wait, frame_start.elapsed());
                 }
                 rc_sse_prev = encoded.base_only_sse;
                 if rc_sse_avg == 0.0 {

@@ -651,10 +651,15 @@ fn process_plane(
                 // The planes run concurrently (one thread each), so split the
                 // machine across them; oversubscribing (available_parallelism
                 // per plane) thrashes on many-core Windows boxes, where the
-                // vvenc base encoder runs concurrently too.
-                let nthreads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-                    / cfg.num_planes())
-                    .max(1);
+                // vvenc base encoder runs concurrently too. The luma plane
+                // does 4x the work of each chroma plane, so weight the split:
+                // luma gets half the machine, chroma a quarter each.
+                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let nthreads = if plane == 0 {
+                    (cores / 2).max(1)
+                } else {
+                    (cores / 4).max(1)
+                };
                 let results = process_tu_rows_parallel(
                     tus_x, tus_y, tu_size, num_layers, nthreads,
                     &|x, y, events, runs, residuals, energy| {
@@ -783,9 +788,12 @@ fn process_plane(
                 }
                 let tus_x = src_s16.width / tu_size;
                 let tus_y = src_s16.height / tu_size;
-                let nthreads = (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-                    / cfg.num_planes())
-                    .max(1);
+                let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+                let nthreads = if plane == 0 {
+                    (cores / 2).max(1)
+                } else {
+                    (cores / 4).max(1)
+                };
                 let results = process_tu_rows_parallel(
                     tus_x, tus_y, tu_size, num_layers, nthreads,
                     &|x, y, events, runs, residuals, energy| {
