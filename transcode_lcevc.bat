@@ -69,6 +69,7 @@ set "TRANSFORM=4x4"
 set "UPSAMPLER=--upsampler adaptive -1023,9214,9214,-1023"
 set "LAMBDA_DIV=4"
 set "PRESET=faster"
+set "FAST=0"
 set "EXTRA="
 :argloop
 if "%~1"=="" goto doneargs
@@ -155,6 +156,11 @@ if "%~1"=="--rdoq-lambda-div" (
 if "%~1"=="--vvc-preset" (
     set "PRESET=%~2"
     shift
+    shift
+    goto argloop
+)
+if "%~1"=="--fast" (
+    set "FAST=1"
     shift
     goto argloop
 )
@@ -285,6 +291,10 @@ if not defined GOP if defined KEYFRAME set "GOP_ARGS=--base-gop-seconds !KEYFRAM
 echo == transcode %INPUT% -^> %OUT%.mp4 ^(base QP 24, !DEPTH!-bit, !BASE_SCALE!x base downscale, !TOTAL_FRAMES! frames, transform !TRANSFORM!^)
 
 set "LCEVC_RDOQ_LAMBDA_DIV=!LAMBDA_DIV!"
+if "!FAST!"=="1" (
+    set "LCEVC_FAST=1"
+    set "EXTRA=!EXTRA! --no-rdoq"
+)
 "%FFMPEG%" -hide_banner -loglevel error -i "%INPUT%" -map 0:v:0 -an -vf "!VFILTER!" -fps_mode cfr -f yuv4mpegpipe -strict -1 -pix_fmt !PIXFMT! - | "%LCEVC_ENC%" -i - --input-format y4m --bit-depth !DEPTH! --base-mode vvc --vvc-qp 24 --vvc-preset !PRESET! --base-gop 30 --scaling-l1 !SCALING_L1! --scaling-l2 !SCALING_L2! --transform !TRANSFORM! !UPSAMPLER! --qm-beta 0.3 --step-width-l1 32767 --step-width-l2 1000 --no-psnr !FRAMES_ARG! !GOP_ARGS! !TARGET_ARGS! !COLOR_ARGS! --base-out "%OUT%.base.266" -o "%OUT%.lcevc" --mux "%OUT%.mp4"!EXTRA!
 if errorlevel 1 (
     echo !! encode failed 1>&2

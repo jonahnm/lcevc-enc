@@ -98,6 +98,7 @@ TRANSFORM="4x4"
 UPSAMPLER_ARGS=(--upsampler adaptive -1023,9214,9214,-1023)
 LAMBDA_DIV=4
 PRESET="faster"
+FAST=0
 ENCODE_ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -166,6 +167,10 @@ while [ $# -gt 0 ]; do
         --vvc-preset)
             PRESET="$2"
             shift 2
+            ;;
+        --fast)
+            FAST=1
+            shift
             ;;
         *)
             ENCODE_ARGS+=("$1")
@@ -287,13 +292,19 @@ elif [ -n "$TARGET" ]; then
 fi
 
 set -o pipefail
+FAST_ENV=()
+FAST_ARGS=()
+if [ "$FAST" -eq 1 ]; then
+    FAST_ENV=(LCEVC_FAST=1)
+    FAST_ARGS=(--no-rdoq)
+fi
 "$FFMPEG" -hide_banner -loglevel error \
     -i "$INPUT" \
     -map 0:v:0 -an \
     -vf "$VFILTER" \
     -fps_mode cfr \
     -f yuv4mpegpipe -strict -1 -pix_fmt "$PIXFMT" - |
-    LCEVC_RDOQ_LAMBDA_DIV="$LAMBDA_DIV" "$LCEVC_ENC" -i - --input-format y4m --bit-depth "$DEPTH" \
+    env LCEVC_RDOQ_LAMBDA_DIV="$LAMBDA_DIV" "${FAST_ENV[@]}" "$LCEVC_ENC" -i - --input-format y4m --bit-depth "$DEPTH" \
         --base-mode vvc \
         --vvc-qp 24 --vvc-preset "$PRESET" \
         --base-gop 30 \
@@ -307,6 +318,7 @@ set -o pipefail
         "${GOP_ARGS[@]}" \
         "${TARGET_ARGS[@]}" \
         "${COLOR_ARGS[@]}" \
+        "${FAST_ARGS[@]}" \
         --base-out "${OUT}.base.266" -o "${OUT}.lcevc" \
         --mux "${OUT}.mp4" \
         "${ENCODE_ARGS[@]}"

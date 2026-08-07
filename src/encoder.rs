@@ -308,6 +308,20 @@ fn encode_tu_residual(
     // threshold in any layer, the whole TU is provably zero - skip the
     // transform, RDOQ and inverse entirely. This is the hot path for
     // smooth content, where most TUs carry no signal.
+    //
+    // In fast mode (LCEVC_FAST=1) the threshold is widened: TUs whose
+    // residual is below the threshold get skipped even if the finest layer
+    // could code a +/-1 level; the RD cost is small (only boundary TUs) and
+    // dense frames run much faster because the transform/RDOQ only runs for
+    // TUs with real signal.
+    static FAST_MULT: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let fast_mult: i32 = *FAST_MULT.get_or_init(|| {
+        if std::env::var("LCEVC_FAST").is_ok() {
+            3
+        } else {
+            1
+        }
+    });
     let mut max_r: i32 = 0;
     for &v in residual {
         let a = (v as i32).abs();
@@ -324,7 +338,7 @@ fn encode_tu_residual(
                 min_thresh = t;
             }
         }
-        if (max_r as i64) < (min_thresh as i64) {
+        if (max_r as i64) < (min_thresh as i64) * fast_mult as i64 {
             return ([0; 16], [0; 16]);
         }
     }
