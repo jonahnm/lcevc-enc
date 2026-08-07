@@ -828,12 +828,45 @@ fn process_plane(
                 }
                 let tus_x = src_s16.width / tu_size;
                 let tus_y = src_s16.height / tu_size;
+                // Sampled drop prediction: run the real TU pipeline on a
+                // strided subset of the luma plane. If none of the sampled
+                // TUs survive the per-TU adaptive check, the full pass would
+                // reconstruct the base-only picture too and the frame-level
+                // adaptive drop discards it - so skip the full transform/RDOQ
+                // phase. This catches frames whose residual is uncodable at
+                // the current step width for any reason (saturation, coarse
+                // quantisation), which otherwise pay the full TU cost for a
+                // dropped frame. The sample's results are discarded.
                 let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
                 let nthreads = if plane == 0 {
                     (cores / 2).max(1)
                 } else {
                     (cores / 4).max(1)
                 };
+                if !skip_l2 && plane == 0 {
+                    let mut energy_scratch = [0.0f64; 16];
+                    let mut kept: u64 = 0;
+                    let mut tot: u64 = 0;
+                    for ty in (0..tus_y).step_by(16) {
+                        for tx in (0..tus_x).step_by(16) {
+                            let x = tx * tu_size;
+                            let y = ty * tu_size;
+                            let (coeffs, _) = encode_tu(
+                                &src_s16, &l2_pred, &table_inter, &forward0, tu_size, x, y,
+                                TemporalSignal::Inter, false, 0, 0, &mut energy_scratch, rdoq);
+                            if coeffs.iter().any(|&c| c != 0) {
+                                kept += 1;
+                            }
+                            tot += 1;
+                        }
+                    }
+                    if tot > 0 && kept == 0 {
+                        skip_l2 = true;
+                        if std::env::var("LCEVC_PROF").is_ok() {
+                            eprintln!("PROF early_drop sampled kept=0/{} sw={sw2}", tot);
+                        }
+                    }
+                }
                 if skip_l2 {
                     // The plane keeps the base-only reconstruction; the
                     // frame-level adaptive drop below fires identically
