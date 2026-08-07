@@ -397,6 +397,12 @@ fn encode_tu_residual(
                     continue;
                 }
             }
+            // Large coefficients sit deep in their quantization interval, so
+            // the +/-1 refinement cannot change the rate and barely changes
+            // the distortion; skipping the candidate loop for them keeps the
+            // RDOQ cost proportional to the boundary coefficients only. The
+            // zero candidate is still handled below for small levels.
+            if q0.unsigned_abs() <= 4 {
             let mut best = q0;
             let mut best_cost = u128::MAX;
             let candidates: [i64; 3] = [q0 - 1, q0, q0 + 1];
@@ -436,6 +442,7 @@ fn encode_tu_residual(
                 }
             }
             coeffs[l] = best.clamp(-8192, 8191) as i16;
+            } // end |q0| <= 4 candidate refinement
         }
     }
 
