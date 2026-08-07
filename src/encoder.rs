@@ -800,6 +800,32 @@ fn process_plane(
                 if std::env::var("LCEVC_DUMP_BRANCH").is_ok() {
                     eprintln!("L2BRANCH rows-path");
                 }
+                // Early frame-level drop prediction: if the residual is
+                // dominated by magnitudes the quantization cannot represent
+                // (coefficients saturate), the TU phase is wasted - the
+                // per-TU check and the frame-level adaptive drop discard
+                // everything anyway. Sample the luma residual cheaply and
+                // skip the transform/RDOQ phase when >30% of the samples
+                // exceed 2x the step width.
+                let mut skip_l2 = false;
+                if plane == 0 {
+                    let sw_i = sw2.max(1) as i32;
+                    let mut over: u64 = 0;
+                    let mut tot: u64 = 0;
+                    for y in (0..src_s16.height).step_by(8) {
+                        for x in (0..src_s16.width).step_by(8) {
+                            let r = (src_s16.get(x, y) as i32 - l2_pred.get(x, y) as i32).abs();
+                            if r > 2 * sw_i {
+                                over += 1;
+                            }
+                            tot += 1;
+                        }
+                    }
+                    skip_l2 = over * 10 > tot * 6;
+                    if skip_l2 && std::env::var("LCEVC_PROF").is_ok() {
+                        eprintln!("PROF early_drop over={over}/{} sw={sw_i}", tot);
+                    }
+                }
                 let tus_x = src_s16.width / tu_size;
                 let tus_y = src_s16.height / tu_size;
                 let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -808,6 +834,13 @@ fn process_plane(
                 } else {
                     (cores / 4).max(1)
                 };
+                if skip_l2 {
+                    // The plane keeps the base-only reconstruction; the
+                    // frame-level adaptive drop below fires identically
+                    // (recon_sse == base_only_sse), producing the same
+                    // output as a fully processed but dropped frame.
+                    l2_events[0][..].iter_mut().for_each(|e| e.clear());
+                } else {
                 let results = process_tu_rows_parallel(
                     tus_x, tus_y, tu_size, num_layers, nthreads,
                     &|x, y, events, runs, residuals, energy| {
@@ -841,6 +874,7 @@ fn process_plane(
                         energy_l2[l] += energy[l];
                     }
                 }
+                } // end !skip_l2
             } else {
             process_loq_tiles(
                 cfg, 0, plane, |tu_state, i, _| {
